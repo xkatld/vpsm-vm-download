@@ -2,7 +2,7 @@ import subprocess
 import os
 
 def download_images():
-    image_file = "/root/vpsm-lxc-download/镜像.md"
+    image_file = "/root/vpsm-vm-download/镜像.md"
     if not os.path.exists(image_file):
         return
 
@@ -24,7 +24,7 @@ def download_images():
         print(f"IMPORTING: {remote_path}")
         try:
             subprocess.run(
-                ["incus", "image", "copy", remote_path, "local:", "--alias", alias, "--quiet"],
+                ["incus", "image", "copy", remote_path, "local:", "--alias", alias, "--vm", "--quiet"],
                 check=True
             )
         except subprocess.CalledProcessError:

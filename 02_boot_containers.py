@@ -2,7 +2,7 @@ import subprocess
 import os
 
 def boot_containers():
-    image_file = "/root/vpsm-lxc-download/镜像.md"
+    image_file = "/root/vpsm-vm-download/镜像.md"
     if not os.path.exists(image_file):
         return
 
@@ -40,12 +40,17 @@ def boot_containers():
             display_release = version_map[distro][release]
         
         for variant in variants:
-            container_name = f"{distro}{display_release}-{variant}-arm64-lxc".replace(".", "")
+            container_name = f"{distro}{display_release}-{variant}-amd64-kvm".replace(".", "")
             
             print(f"LAUNCHING: {container_name} from {image_alias}")
             try:
                 subprocess.run(
-                    ["incus", "launch", image_alias, container_name],
+                    [
+                        "incus", "launch", image_alias, container_name,
+                        "--vm",
+                        "--config", "security.secureboot=false",
+                        "--device", "root,size=5GB"
+                    ],
                     check=True
                 )
             except subprocess.CalledProcessError:
