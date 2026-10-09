@@ -1,0 +1,169 @@
+name: 构建虚拟机镜像
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    paths:
+      - '**/*.py'
+      - '镜像.md'
+      - 'scripts/**'
+      - '.github/workflows/**'
+  schedule:
+    - cron: '43 2 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: incus-vm-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: 检查代码与生成矩阵
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: 执行单元与语法检查
+        run: |
+          python3 -m compileall -q build_pipeline.py scripts tests
+          python3 -m unittest discover -s tests -v
+          bash -n scripts/setup-incus.sh
+      - name: 生成虚拟机矩阵
+        id: matrix
+        run: |
+          matrix=$(python3 build_pipeline.py --manifest '镜像.md' --matrix)
+          printf 'matrix=%s\n' "$matrix" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$matrix" > build-matrix.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-matrix
+          path: build-matrix.json
+          retention-days: 7
+
+  build:
+    name: ${{ matrix.distro }} ${{ matrix.release }} / ${{ matrix.architecture }}
+    needs: validate
+    if: github.event_name != 'pull_request'
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix: ${{ fromJSON(needs.validate.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    env:
+      TARGET_ARCH: ${{ matrix.architecture }}
+      TARGET_DISTRO: ${{ matrix.distro }}
+      TARGET_RELEASE: ${{ matrix.release }}
+      PYTHONUNBUFFERED: '1'
+      LIBGUESTFS_BACKEND: direct
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: 检查虚拟化能力并初始化
+        run: bash scripts/setup-incus.sh
+      - name: 构建与离线净化虚拟机
+        run: |
+          sudo --preserve-env=GITHUB_STEP_SUMMARY,PYTHONUNBUFFERED,LIBGUESTFS_BACKEND \
+            python3 build_pipeline.py --manifest '镜像.md' \
+              --architecture "$TARGET_ARCH" --distro "$TARGET_DISTRO" \
+              --release "$TARGET_RELEASE" --output-dir dist
+      - name: 启用验收内网双栈
+        run: |
+          sudo incus network set incusbr0 ipv6.nat true
+          sudo incus network set incusbr0 ipv6.address auto
+      - name: 重导入与双克隆验收
+        id: acceptance
+        timeout-minutes: 30
+        run: |
+          sudo --preserve-env=GITHUB_STEP_SUMMARY,PYTHONUNBUFFERED \
+            python3 -I scripts/accept_image.py --output-dir dist \
+              --distro "$TARGET_DISTRO" --release "$TARGET_RELEASE" \
+              --architecture "$TARGET_ARCH" --report-dir acceptance
+      - name: 整理验收报告权限
+        if: ${{ always() && steps.acceptance.outcome != 'skipped' }}
+        run: |
+          if sudo test -d acceptance; then
+            sudo chown -R "$(id -u):$(id -g)" acceptance
+            chmod -R u+rwX acceptance
+          fi
+      - name: 上传验收报告
+        if: ${{ always() && steps.acceptance.outcome != 'skipped' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: acceptance-${{ matrix.distro }}-${{ matrix.release }}-${{ matrix.architecture }}
+          path: acceptance/
+          if-no-files-found: error
+          retention-days: 7
+      - name: 整理镜像产物权限
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" dist
+          chmod -R u+rwX dist
+      - name: 上传通过验收的镜像
+        uses: actions/upload-artifact@v4
+        with:
+          name: images-${{ matrix.distro }}-${{ matrix.release }}-${{ matrix.architecture }}
+          path: dist/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+      - name: 收集失败诊断
+        if: failure()
+        run: |
+          mkdir -p diagnostics
+          df -h > diagnostics/disk.txt
+          sudo journalctl -u incus --no-pager -n 200 > diagnostics/incus.log 2>&1 || true
+          sudo incus list --format=json > diagnostics/instances.json 2>&1 || true
+          sudo incus network show incusbr0 > diagnostics/network.txt 2>&1 || true
+          ip -4 route show table all > diagnostics/routes4.txt 2>&1 || true
+          ip -6 route show table all > diagnostics/routes6.txt 2>&1 || true
+          sudo iptables -S FORWARD > diagnostics/forward.txt 2>&1 || true
+          if sudo test -f dist/build-summary.json; then
+            sudo cp dist/build-summary.json diagnostics/
+          fi
+          sudo chown -R "$(id -u):$(id -g)" diagnostics
+          chmod -R u+rwX diagnostics
+      - name: 上传失败诊断
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostics-${{ matrix.distro }}-${{ matrix.release }}-${{ matrix.architecture }}
+          path: diagnostics/
+          retention-days: 7
+
+  verify:
+    name: 汇总虚拟机产物校验
+    needs: [validate, build]
+    if: ${{ always() && github.event_name != 'pull_request' && needs.validate.result == 'success' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: 确认全部构建验收成功
+        env:
+          BUILD_RESULT: ${{ needs.build.result }}
+        run: test "$BUILD_RESULT" = success
+      - name: 安装磁盘校验工具
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-utils
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-matrix
+          path: expected
+      - name: 逐份下载与校验
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: python3 -I scripts/verify_artifacts.py --matrix expected/build-matrix.json --run-id "$GITHUB_RUN_ID"
