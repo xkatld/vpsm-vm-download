@@ -5,3 +5,4 @@ acceptance/
 diagnostics/
 build-matrix.json
 expected/
+AGENTS.md
