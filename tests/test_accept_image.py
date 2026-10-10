@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
 from build_pipeline import COMMON_PACKAGES, ImageSpec, README_CONTENT
+from scripts.image_cleanup import ACCOUNT_BACKUP_SUFFIXES, ACCOUNT_FILES, CREDENTIAL_PATHS, HISTORY_FILES
 from scripts.accept_image import (
     Acceptance, AcceptanceTerminated, CheckError, check_os_release, import_paths,
     instance_addresses, main, public_hostkey_fingerprints, safe_error,
@@ -457,12 +458,73 @@ class AcceptanceTests(unittest.TestCase):
         with patch.object(self.acceptance, "guest", return_value=completed()) as guest:
             self.acceptance.check_credential_backups()
         script = guest.call_args.args[0][2]
-        for account in ("shadow", "gshadow", "passwd", "group"):
-            self.assertIn(f"/etc/{account}-", script)
-            self.assertIn(f"/etc/{account}.bak", script)
+        for account in ACCOUNT_FILES:
+            for suffix in ACCOUNT_BACKUP_SUFFIXES:
+                self.assertIn(f"/etc/{account}{suffix}", script)
             self.assertIn(f"/var/backups/{account}*", script)
+        for path in (*HISTORY_FILES, "/root/.ssh"):
+            self.assertIn(path, script)
         self.assertIn('[ -L "$path" ]', script)
-        self.assertNotIn("rm ", script)
+        for forbidden in ("rm ", "cat ", "head ", "tail ", "sed ", "awk "):
+            self.assertNotIn(forbidden, script)
+
+    def test_backup_hits_report_only_fixed_rule_and_exit_code(self):
+        for stage in ("credential-backups", "clone-credential-backups"):
+            for rule in ("/etc/shadow-", "/var/backups/passwd*", "/root/.ssh"):
+                with self.subTest(stage=stage, rule=rule):
+                    acceptance = Acceptance(self.spec, Path("dist"), Path("acceptance"))
+                    number = f"{CREDENTIAL_PATHS.index(rule) + 1:03d}"
+                    error = subprocess.CalledProcessError(1, ["秘密参数"], output=number + "\n", stderr="秘密错误")
+                    with patch.object(acceptance, "guest", side_effect=error):
+                        with patch("builtins.print") as output:
+                            with self.assertRaises(CheckError) as caught:
+                                acceptance.step(stage, acceptance.check_credential_backups)
+                    self.assertIn(f"命中规则 {number}：{rule}", str(caught.exception))
+                    self.assertIn("退出码 1", str(caught.exception))
+                    self.assertEqual(acceptance.report["error"]["stage"], stage)
+                    emitted = json.dumps(acceptance.report, ensure_ascii=False) + str(output.call_args_list)
+                    self.assertNotIn("秘密", emitted)
+                    self.assertTrue(caught.exception.__suppress_context__)
+
+    def test_backup_execution_faults_preserve_code_without_untrusted_output(self):
+        for code, stdout in ((1, ""), (1, "999\n"), (1, "001\n秘密"), (1, "/etc/shadow-\n"),
+                             (2, "001\n"), (126, ""), (127, "秘密输出"), (-15, "")):
+            with self.subTest(code=code, stdout=stdout):
+                error = subprocess.CalledProcessError(code, ["秘密参数"], output=stdout, stderr="秘密错误")
+                with patch.object(self.acceptance, "guest", side_effect=error):
+                    with self.assertRaisesRegex(CheckError, f"执行故障，退出码 {code}") as caught:
+                        self.acceptance.check_credential_backups()
+                self.assertNotIn("命中规则", str(caught.exception))
+                self.assertNotIn("秘密", str(caught.exception))
+
+    def test_backup_unexpected_success_output_is_not_a_hit(self):
+        with patch.object(self.acceptance, "guest", return_value=completed("秘密输出")):
+            with self.assertRaisesRegex(CheckError, "无效结果，退出码 0") as caught:
+                self.acceptance.check_credential_backups()
+        self.assertNotIn("秘密", str(caught.exception))
+
+    def test_backup_timeout_is_not_a_hit(self):
+        error = subprocess.TimeoutExpired(["秘密参数"], 10, output="001\n", stderr="秘密错误")
+        with patch.object(self.acceptance, "guest", side_effect=error):
+            with patch("builtins.print"):
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    self.acceptance.step("credential-backups", self.acceptance.check_credential_backups)
+        self.assertEqual(self.acceptance.report["error"]["message"], "命令执行超时")
+
+    def test_backup_probe_shell_reports_fixed_rules_without_reading_files(self):
+        with patch.object(self.acceptance, "guest", return_value=completed()) as guest:
+            self.acceptance.check_credential_backups()
+        script = guest.call_args.args[0][2].replace('[ -e "$path" ]', 'probe -e "$path"').replace(
+            '[ -L "$path" ]', 'probe -L "$path"')
+        for rule in (None, "/etc/shadow-", "/root/.ssh"):
+            with self.subTest(rule=rule):
+                prefix = 'probe() { return 1; }; ' if rule is None else (
+                    f'probe() {{ test "$2" = {rule} && test "$1" = -L; }}; '
+                )
+                result = subprocess.run(["sh", "-c", prefix + script], text=True, capture_output=True, check=False)
+                self.assertEqual(result.returncode, 0 if rule is None else 1)
+                self.assertEqual(result.stdout, "" if rule is None else f"{CREDENTIAL_PATHS.index(rule) + 1:03d}\n")
+                self.assertEqual(result.stderr, "")
 
     def test_ssh_forces_each_address_family_and_uses_environment_password(self):
         acceptance = self.acceptance

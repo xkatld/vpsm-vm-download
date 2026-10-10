@@ -26,6 +26,7 @@ from build_pipeline import (
     COMMON_PACKAGES, NATIVE_ARCHITECTURES, README_CONTENT, RELEASE_DISPLAY,
     RUNNERS, ImageSpec,
 )
+from scripts.image_cleanup import CREDENTIAL_PATHS
 from scripts.verify_artifacts import verify_artifact
 
 
@@ -436,14 +437,23 @@ class Acceptance:
             raise CheckError("发布镜像的管理员口令字段必须严格为感叹号")
 
     def check_credential_backups(self) -> None:
-        paths = (
-            "/etc/shadow- /etc/shadow~ /etc/shadow.bak /etc/gshadow- /etc/gshadow~ /etc/gshadow.bak "
-            "/etc/passwd- /etc/passwd~ /etc/passwd.bak /etc/group- /etc/group~ /etc/group.bak "
-            "/var/backups/shadow* /var/backups/gshadow* /var/backups/passwd* /var/backups/group* "
-            "/root/.ssh /root/.bash_history /root/.ash_history /root/.zsh_history"
+        rules = {f"{index:03d}\n": path for index, path in enumerate(CREDENTIAL_PATHS, 1)}
+        script = "set -eu; " + " ".join(
+            f"for path in {path}; do "
+            'if [ -e "$path" ] || [ -L "$path" ]; then '
+            f"printf '%s\\n' '{index:03d}'; exit 1; fi; done;"
+            for index, path in enumerate(CREDENTIAL_PATHS, 1)
         )
-        self.guest(["sh", "-c", "set -eu; for path in " + paths
-                    + '; do if [ -e "$path" ] || [ -L "$path" ]; then exit 1; fi; done'])
+        try:
+            result = self.guest(["sh", "-c", script])
+        except subprocess.CalledProcessError as exc:
+            if exc.returncode == 1 and exc.stdout in rules:
+                raise CheckError(
+                    f"凭据残留命中规则 {exc.stdout.strip()}：{rules[exc.stdout]}，退出码 {exc.returncode}"
+                ) from None
+            raise CheckError(f"凭据残留检查执行故障，退出码 {exc.returncode}") from None
+        if result.stdout:
+            raise CheckError(f"凭据残留检查返回无效结果，退出码 {result.returncode}")
 
     def ssh(self, family: int, address: str) -> None:
         parsed = ipaddress.ip_address(address)

@@ -1,18 +1,14 @@
 from __future__ import annotations
 
+import fnmatch
 import importlib
 from pathlib import Path, PurePosixPath
 
+from scripts.image_cleanup import CREDENTIAL_DIRECTORIES, CREDENTIAL_PATHS
 from scripts.vm_image import validate_disk
 
 
-ACCOUNT_FILES = ("passwd", "shadow", "group", "gshadow", "subuid", "subgid")
-HISTORY_FILES = (
-    "/root/.bash_history", "/root/.ash_history", "/root/.zsh_history",
-    "/root/.python_history", "/root/.mysql_history", "/root/.sqlite_history",
-    "/root/.history", "/root/.lesshst", "/root/.local/share/fish/fish_history",
-)
-REQUIRED_PATHS = ("/etc", "/etc/ssh", "/var/lib/dbus", "/var/backups", "/root")
+REQUIRED_PATHS = ("/etc", "/etc/ssh", "/var/lib/dbus", "/var/backups", "/root", *CREDENTIAL_PATHS)
 
 
 def safe_guest_path(path: str) -> str:
@@ -38,18 +34,15 @@ def safe_parent(guest: object, path: str) -> bool:
 
 
 def cleanup_targets(guest: object) -> set[str]:
-    paths = set(HISTORY_FILES)
-    patterns = ["/etc/ssh/ssh_host_*"]
-    for name in ACCOUNT_FILES:
-        paths.update(f"/etc/{name}{suffix}" for suffix in ("-", "~", ".bak", ".old", ".orig", ".save"))
-        patterns.append(f"/var/backups/{name}.*")
+    paths = {path for path in CREDENTIAL_PATHS if "*" not in path}
+    patterns = ("/etc/ssh/ssh_host_*", *(path for path in CREDENTIAL_PATHS if "*" in path))
     for pattern in patterns:
         if safe_parent(guest, pattern):
             parent = str(PurePosixPath(pattern).parent)
             for path in guest.glob_expand(pattern):
                 safe_guest_path(path)
-                if str(PurePosixPath(path).parent) != parent:
-                    raise ValueError("清理目标超出允许目录")
+                if str(PurePosixPath(path).parent) != parent or not fnmatch.fnmatchcase(path, pattern):
+                    raise ValueError("清理目标超出允许范围")
                 paths.add(path)
     return paths
 
@@ -101,9 +94,14 @@ def sanitize_disk(path: Path) -> None:
             if not safe_parent(guest, target):
                 continue
             if guest.exists(target) or guest.is_symlink(target):
-                if not guest.is_symlink(target) and not guest.is_file(target):
-                    raise ValueError("清理目标不是普通文件或符号链接")
-                guest.rm(target)
+                if target in CREDENTIAL_DIRECTORIES and not guest.is_symlink(target) and guest.is_dir(target):
+                    if guest.realpath(target) != target:
+                        raise ValueError("清理目录包含符号链接")
+                    guest.rm_rf(target)
+                else:
+                    if not guest.is_symlink(target) and not guest.is_file(target):
+                        raise ValueError("清理目标不是普通文件或符号链接")
+                    guest.rm(target)
         if guest.is_symlink(machine_id) or not guest.is_file(machine_id) or guest.filesize(machine_id) != 0:
             raise ValueError("系统身份未清空")
         if safe_parent(guest, dbus_id):

@@ -403,33 +403,186 @@ class SetupTests(PipelineTestCase):
         self.assertNotIn("::error::", message)
         self.assertLess(len(message), 2200)
 
+    def index_result(self, command, returncode=0, stdout="", stderr=""):
+        marker = command[-1].split("printf '\\n", 1)[1].split("%s", 1)[0]
+        result = completed(f"{stdout}\n{marker}{returncode}\n")
+        result.stderr = stderr
+        return result
+
     def test_index_retries_before_installation(self):
-        self.clock()
+        now = self.clock()
         pipeline = self.pipeline()
-        commands = []
-        index_attempts = [0]
+        events = []
 
-        def step(container, label, command=None, **kwargs):
-            commands.append(label)
-            if label == "软件源索引":
-                index_attempts[0] += 1
-                if index_attempts[0] == 1:
-                    raise build_pipeline.SetupStepError("网络尚未就绪")
+        def execute(command, **kwargs):
+            events.append("索引开始")
+            now[0] += 40
+            result = self.index_result(command, 1 if len(events) == 1 else 0)
+            events.append("索引结束")
+            return result
 
-        with patch.object(pipeline, "setup_step", side_effect=step):
+        self.subprocess.side_effect = execute
+        with patch.object(pipeline, "setup_step", side_effect=lambda *args: events.append(args[1])):
             pipeline.setup_one(self.spec, "vm")
-        self.assertEqual(commands[:3], ["软件源索引", "软件源索引", "安装远程登录"])
-        self.assertEqual(commands.count("安装远程登录"), 1)
-        self.assertEqual(commands[-1], "设置临时密码")
+        self.assertEqual(events[:5], ["索引开始", "索引结束", "索引开始", "索引结束", "安装远程登录"])
+        self.assertEqual(events.count("安装远程登录"), 1)
+        self.assertEqual(events[-1], "设置临时密码")
+        self.assertEqual(now[0], 82)
+        self.assertEqual([item.kwargs["timeout"] for item in self.subprocess.call_args_list], [615, 573])
 
     def test_index_timeout_blocks_installation(self):
         now = self.clock()
-        pipeline = self.pipeline(ssh_timeout=3)
-        with patch.object(pipeline, "setup_step", side_effect=build_pipeline.SetupStepError("失败")) as step:
-            with self.assertRaises(build_pipeline.SetupStepError):
+        pipeline = self.pipeline(package_index_timeout=3)
+        self.subprocess.side_effect = lambda command, **kwargs: self.index_result(command, 1)
+        with patch.object(pipeline, "setup_step") as step:
+            with self.assertRaisesRegex(build_pipeline.SetupStepError, "软件源索引准备超时"):
                 pipeline.setup_one(self.spec, "vm")
         self.assertEqual(now[0], 3)
-        self.assertTrue(all(item.args[1] == "软件源索引" for item in step.call_args_list))
+        self.assertEqual(self.subprocess.call_count, 2)
+        step.assert_not_called()
+
+    def test_index_has_independent_budget_and_host_margin(self):
+        now = self.clock()
+        pipeline = self.pipeline(ssh_timeout=3)
+
+        def execute(command, **kwargs):
+            args = build_pipeline.shlex.split(command[-1])
+            self.assertEqual(args[:6], ["timeout", "-k", "5", "600", "sh", "-c"])
+            self.assertEqual(kwargs["timeout"], 615)
+            now[0] += 180
+            return self.index_result(command)
+
+        self.subprocess.side_effect = execute
+        pipeline.wait_for_package_index("vm", "exec dnf makecache")
+        self.subprocess.assert_called_once()
+        self.assertEqual(now[0], 180)
+        self.assertEqual(pipeline.ssh_timeout, 3)
+
+    def test_index_native_timeout_and_exec_for_all_releases(self):
+        self.clock()
+        self.subprocess.side_effect = lambda command, **kwargs: self.index_result(command)
+        for distro, release in RELEASES:
+            with self.subTest(distro=distro, release=release):
+                pipeline = self.pipeline(specs=[spec_for(distro, release)])
+                with patch.object(pipeline, "setup_step"):
+                    pipeline.setup_one(pipeline.specs[0], "vm")
+                args = build_pipeline.shlex.split(self.subprocess.call_args.args[0][-1])
+                self.assertEqual(args[:6], ["timeout", "-k", "5", "600", "sh", "-c"])
+                expected = ("apk update" if distro == "alpine" else
+                            "apt-get -o APT::Update::Error-Mode=any update" if distro in {"debian", "ubuntu"}
+                            else "dnf makecache")
+                self.assertTrue(args[6].endswith("exec " + expected))
+                self.assertNotIn("--foreground", args)
+
+    def test_index_guest_timeout_or_signal_never_retries(self):
+        self.clock()
+        pipeline = self.pipeline()
+        for returncode in (124, 125, 126, 127, 137, 143):
+            with self.subTest(returncode=returncode):
+                self.subprocess.reset_mock()
+                self.subprocess.side_effect = lambda command, **kwargs: self.index_result(command, returncode)
+                with patch.object(pipeline, "setup_step") as step:
+                    with self.assertRaisesRegex(build_pipeline.SetupStepError, "停止重试"):
+                        pipeline.setup_one(self.spec, "vm")
+                self.subprocess.assert_called_once()
+                step.assert_not_called()
+
+    def test_index_execution_failure_never_retries(self):
+        self.clock()
+        pipeline = self.pipeline()
+        failures = (
+            subprocess.TimeoutExpired([self.password], 615, output=self.password, stderr="连接中断"),
+            subprocess.CalledProcessError(1, [self.password], stderr="代理连接中断"),
+            OSError("执行层失败"),
+        )
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__):
+                self.subprocess.reset_mock()
+                self.subprocess.side_effect = failure
+                output = io.StringIO()
+                with patch.object(pipeline, "setup_step") as step, contextlib.redirect_stderr(output):
+                    with self.assertRaisesRegex(build_pipeline.SetupStepError, "未确认客户机命令结束"):
+                        pipeline.setup_one(self.spec, "vm")
+                self.subprocess.assert_called_once()
+                step.assert_not_called()
+                self.assertIn("耗时 0.0 秒", output.getvalue())
+                self.assertIn("退出码未知", output.getvalue())
+                self.assertNotIn(self.password, output.getvalue())
+
+    def test_index_missing_or_forged_completion_never_retries(self):
+        self.clock()
+        pipeline = self.pipeline()
+        marker = "VPSM_INDEX_EXIT_" + "a" * 32 + "="
+        outputs = ("", "\nVPSM_INDEX_EXIT=0\n", "\nVPSM_INDEX_EXIT_伪造=0\n",
+                   f"\n{marker}0\n额外输出", f"\n{marker}错误\n")
+        for output in outputs:
+            with self.subTest(output=output), patch("build_pipeline.secrets.token_hex", return_value="a" * 32):
+                self.subprocess.reset_mock()
+                self.subprocess.return_value = completed(output)
+                with self.assertRaisesRegex(build_pipeline.SetupStepError, "结束状态异常"):
+                    pipeline.wait_for_package_index("vm", "exec dnf makecache")
+                self.subprocess.assert_called_once()
+
+    def test_index_logs_elapsed_status_and_bounded_redacted_diagnostics(self):
+        now = self.clock()
+        with patch.dict(os.environ, {"SSHPASS": "继承凭据"}):
+            pipeline = self.pipeline()
+
+        def execute(command, **kwargs):
+            now[0] += 75
+            return self.index_result(command, stdout=self.password + " 继承凭据\n::error::" + "内容" * 3000,
+                                     stderr="诊断尾部\n" * 30)
+
+        self.subprocess.side_effect = execute
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output):
+            pipeline.wait_for_package_index("vm", "exec dnf makecache")
+        message = output.getvalue()
+        self.assertIn("第 1 轮，耗时 75.0 秒，退出码 0", message)
+        self.assertIn("[已截断]", message)
+        self.assertNotIn(self.password, message)
+        self.assertNotIn("继承凭据", message)
+        self.assertNotIn("::error::", message)
+        self.assertNotIn("exec dnf makecache", message)
+        self.assertLess(len(message), 2200)
+
+    def test_index_success_after_deadline_is_rejected(self):
+        now = self.clock()
+        pipeline = self.pipeline(package_index_timeout=3)
+
+        def execute(command, **kwargs):
+            now[0] += 4
+            return self.index_result(command)
+
+        self.subprocess.side_effect = execute
+        with self.assertRaisesRegex(build_pipeline.SetupStepError, "软件源索引准备超时"):
+            pipeline.wait_for_package_index("vm", "exec dnf makecache")
+        self.subprocess.assert_called_once()
+
+    def test_index_fractional_budget_uses_portable_integer_duration(self):
+        self.clock()
+        pipeline = self.pipeline(package_index_timeout=0.5)
+        self.subprocess.side_effect = lambda command, **kwargs: self.index_result(command)
+        pipeline.wait_for_package_index("vm", "exec apk update")
+        args = build_pipeline.shlex.split(self.subprocess.call_args.args[0][-1])
+        self.assertEqual(args[:4], ["timeout", "-k", "5", "1"])
+        self.assertEqual(self.subprocess.call_args.kwargs["timeout"], 16)
+
+    def test_index_timeout_configuration(self):
+        self.assertEqual(build_pipeline.parse_args(["--matrix"]).package_index_timeout, 600)
+        args = ["--architecture", "amd64", "--distro", "debian", "--release", "bookworm",
+                "--manifest", str(self.manifest), "--package-index-timeout", "900"]
+        with patch.object(build_pipeline.Pipeline, "run", autospec=True) as run:
+            self.assertEqual(build_pipeline.main(args), 0)
+        self.assertEqual(run.call_args.args[0].package_index_timeout, 900)
+        self.assertEqual(run.call_args.args[0].ssh_timeout, 120)
+
+    def test_index_timeout_must_be_finite_and_positive(self):
+        self.native_host()
+        for timeout in (0, -1, float("nan"), float("inf")):
+            with self.subTest(timeout=timeout), self.assertRaisesRegex(ValueError, "等待期限"):
+                self.pipeline(package_index_timeout=timeout).preflight()
+        self.subprocess.assert_not_called()
 
     def test_common_packages_and_enterprise_repositories(self):
         for distro, release in RELEASES:

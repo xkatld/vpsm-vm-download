@@ -6,6 +6,9 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from scripts import sanitize_vm
+from scripts.image_cleanup import (
+    ACCOUNT_BACKUP_SUFFIXES, ACCOUNT_FILES, CREDENTIAL_DIRECTORIES, CREDENTIAL_PATHS, HISTORY_FILES,
+)
 
 
 class FakeGuest:
@@ -81,11 +84,18 @@ class FakeGuest:
             self.files.pop(path, None)
             self.links.pop(path, None)
 
+    def rm_rf(self, path):
+        self.calls.append(("rm_rf", path))
+        if not self.skip_remove:
+            self.files = {name: data for name, data in self.files.items() if name != path and not name.startswith(path + "/")}
+            self.links = {name: target for name, target in self.links.items() if name != path and not name.startswith(path + "/")}
+            self.directories = {name for name in self.directories if name != path and not name.startswith(path + "/")}
+
     def ln_sf(self, target, path):
         self.links[path] = target
 
     def glob_expand(self, pattern):
-        return [path for path in set(self.files) | set(self.links) if fnmatch.fnmatchcase(path, pattern)]
+        return [path for path in set(self.files) | set(self.links) | self.directories if fnmatch.fnmatchcase(path, pattern)]
 
     def filesize(self, path):
         return len(self.files[self.links.get(path, path)])
@@ -134,6 +144,67 @@ class SanitizeVmTests(unittest.TestCase):
         self.assertEqual(mounts, ["/", "/var", "/var/lib"])
         self.assertEqual(self.guest.calls[-3:], [("sync",), ("shutdown",), ("close",)])
         self.assertIn(("backend", "direct"), self.guest.calls)
+
+    def test_cleanup_covers_shared_account_and_history_rules(self):
+        self.guest.directories.update({"/root/.local", "/root/.local/share", "/root/.local/share/fish"})
+        targets = set(HISTORY_FILES)
+        for account in ACCOUNT_FILES:
+            targets.update(f"/etc/{account}{suffix}" for suffix in ACCOUNT_BACKUP_SUFFIXES)
+            targets.update(f"/var/backups/{account}{suffix}" for suffix in ("", "-", "~", ".bak", "-old.gz"))
+        self.guest.files.update({path: b"backup" for path in targets})
+        preserved = {"/var/backups/unrelated": b"keep", "/root/.ssh_notes": b"keep", "/etc/passwd": b"keep"}
+        self.guest.files.update(preserved)
+        sanitize_vm.sanitize_disk(self.disk)
+        self.assertFalse(targets & self.guest.files.keys())
+        for path, value in preserved.items():
+            self.assertEqual(self.guest.files[path], value)
+        self.assertTrue(set(CREDENTIAL_DIRECTORIES) <= set(CREDENTIAL_PATHS))
+
+    def test_root_ssh_directory_is_only_recursive_target(self):
+        self.guest.directories.update({"/root/.ssh", "/root/.ssh/nested"})
+        self.guest.files["/root/.ssh/nested/key"] = b"private"
+        self.guest.links["/root/.ssh/linked"] = "/etc/shadow"
+        sanitize_vm.sanitize_disk(self.disk)
+        self.assertNotIn("/root/.ssh", self.guest.directories)
+        self.assertNotIn("/root/.ssh/nested/key", self.guest.files)
+        self.assertEqual(self.guest.files["/etc/shadow"], b"preserved")
+        self.assertEqual([call for call in self.guest.calls if call[0] == "rm_rf"], [("rm_rf", "/root/.ssh")])
+
+    def test_root_ssh_link_is_unlinked_without_following_target(self):
+        self.guest.links["/root/.ssh"] = "/etc"
+        sanitize_vm.sanitize_disk(self.disk)
+        self.assertNotIn("/root/.ssh", self.guest.links)
+        self.assertIn(("rm", "/root/.ssh"), self.guest.calls)
+        self.assertFalse(any(call[0] == "rm_rf" for call in self.guest.calls))
+        self.assertEqual(self.guest.files["/etc/shadow"], b"preserved")
+
+    def test_backup_directory_is_not_recursively_removed(self):
+        self.guest.directories.add("/var/backups/passwd.archive")
+        self.guest.files["/var/backups/passwd.archive/keep"] = b"keep"
+        with self.assertRaises(ValueError):
+            sanitize_vm.sanitize_disk(self.disk)
+        self.assertEqual(self.guest.files["/var/backups/passwd.archive/keep"], b"keep")
+        self.assertNotIn(("rm_rf", "/var/backups/passwd.archive"), self.guest.calls)
+
+    def test_root_parent_link_rejected(self):
+        self.guest.links["/root"] = "/etc"
+        with self.assertRaises(ValueError):
+            sanitize_vm.sanitize_disk(self.disk)
+        self.assertFalse(any(call[0] == "rm_rf" for call in self.guest.calls))
+
+    def test_history_submount_is_mounted_before_cleanup(self):
+        self.guest.directories.update({"/root/.local", "/root/.local/share", "/root/.local/share/fish"})
+        self.guest.mountpoints["/root/.local"] = "/dev/vg/history"
+        self.guest.files["/root/.local/share/fish/fish_history"] = b"history"
+        sanitize_vm.sanitize_disk(self.disk)
+        self.assertIn(("mount", "/dev/vg/history", "/root/.local"), self.guest.calls)
+        self.assertNotIn("/root/.local/share/fish/fish_history", self.guest.files)
+
+    def test_same_parent_unmatched_glob_path_rejected(self):
+        with patch.object(self.guest, "glob_expand", return_value=["/etc/ssh/sshd_config"]):
+            with self.assertRaises(ValueError):
+                sanitize_vm.sanitize_disk(self.disk)
+        self.assertEqual(self.guest.files["/etc/ssh/sshd_config"], b"preserved")
 
     def test_ambiguous_roots_rejected_and_closed(self):
         for roots in ([], ["/dev/a", "/dev/b"]):

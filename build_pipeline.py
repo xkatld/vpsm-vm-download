@@ -136,12 +136,13 @@ class SetupStepError(RuntimeError):
 class Pipeline:
     def __init__(self, specs: Sequence[ImageSpec], output_dir: Path,
                  root_password: str | None = None, ssh_timeout: float = 120,
-                 agent_timeout: float = 300) -> None:
+                 agent_timeout: float = 300, package_index_timeout: float = 600) -> None:
         self.specs = list(specs)
         self.output_dir = Path(output_dir)
         self.root_password = root_password if root_password is not None else secrets.token_urlsafe(32)
         self.ssh_timeout = ssh_timeout
         self.agent_timeout = agent_timeout
+        self.package_index_timeout = package_index_timeout
         self.inherited_secrets = tuple(os.environ.get(key, "") for key in ("SSHPASS", "IMAGE_ROOT_PASSWORD"))
         self.run_id = uuid.uuid4().hex
         self.resource_prefix = f"vpsm-{self.run_id}-"
@@ -223,7 +224,8 @@ class Pipeline:
             raise ValueError("不支持的发行版")
         if not self.root_password or any(value in self.root_password for value in "\n\r\x00"):
             raise ValueError("临时测试密码格式错误")
-        if any(not math.isfinite(value) or value <= 0 for value in (self.ssh_timeout, self.agent_timeout)):
+        if any(not math.isfinite(value) or value <= 0 for value in
+               (self.ssh_timeout, self.agent_timeout, self.package_index_timeout)):
             raise ValueError("等待期限必须是有限正数")
         if self.output_dir.is_symlink() or (self.output_dir.exists() and
                 (not self.output_dir.is_dir() or any(self.output_dir.iterdir()))):
@@ -297,16 +299,39 @@ class Pipeline:
             raise SetupStepError(f"配置步骤 {label} 失败：{exc}") from None
 
     def wait_for_package_index(self, container: str, command: str) -> None:
-        deadline = time.monotonic() + self.ssh_timeout
+        deadline = time.monotonic() + self.package_index_timeout
         last_error = "尚未完成软件源索引更新"
+        attempt = 0
         while (remaining := deadline - time.monotonic()) > 0:
+            attempt += 1
+            guest_timeout = max(1, math.ceil(remaining))
+            marker = "VPSM_INDEX_EXIT_" + secrets.token_hex(16) + "="
+            wrapped = shell_lines(
+                f"timeout -k 5 {guest_timeout} sh -c {shell_quote(command)}",
+                "index_status=$?", f'printf \'\\n{marker}%s\\n\' "$index_status"',
+            )
+            started = time.monotonic()
             try:
-                self.setup_step(container, "软件源索引", command, timeout=min(30, remaining))
-            except SetupStepError as exc:
-                last_error = str(exc)
-            else:
+                result = self.incus(["exec", container, "--", "sh", "-c", wrapped],
+                                    timeout=guest_timeout + 15, diagnostic_stderr=True)
+            except IncusCommandError as exc:
+                message = f"软件源索引第 {attempt} 轮，耗时 {time.monotonic() - started:.1f} 秒，退出码未知：{exc}"
+                print(message, file=sys.stderr)
+                raise SetupStepError(message + "；未确认客户机命令结束，停止重试") from None
+            output, separator, status = result.stdout.rpartition("\n" + marker)
+            returncode = int(status.strip()) if separator and re.fullmatch(r"\d{1,3}\n", status) else None
+            detail = self.safe_stderr((output if separator else result.stdout) + "\n" + result.stderr)
+            last_error = (f"软件源索引第 {attempt} 轮，耗时 {time.monotonic() - started:.1f} 秒，"
+                          f"退出码 {returncode if returncode is not None else '未知'}")
+            if detail:
+                last_error += "\n" + detail
+            print(last_error, file=sys.stderr)
+            if returncode is None or returncode >= 124:
+                raise SetupStepError(last_error + "\n客户机超时或结束状态异常，停止重试")
+            if returncode == 0:
                 if time.monotonic() <= deadline:
                     return
+                break
             time.sleep(min(2, max(0, deadline - time.monotonic())))
         raise SetupStepError("软件源索引准备超时：" + last_error)
 
@@ -322,7 +347,7 @@ class Pipeline:
         else:
             index, install = "dnf makecache", "dnf install -y openssh-server"
             services = [("启用远程登录", "systemctl enable sshd"), ("重启远程登录", "systemctl restart sshd")]
-        self.wait_for_package_index(container, prefix + index)
+        self.wait_for_package_index(container, prefix + "exec " + index)
         for label, command in [
             ("安装远程登录", install), ("生成测试主机密钥", "ssh-keygen -A"),
             ("配置远程登录", self.ssh_config_command()), *services,
@@ -442,16 +467,18 @@ class Pipeline:
         )
 
     def cleanup_containers(self) -> None:
+        from scripts.image_cleanup import CREDENTIAL_PATHS
+
         common = shell_lines(
             "set -eu", "printf 'root:!\\n' | chpasswd -e",
-            "for path in /etc/shadow- /etc/shadow~ /etc/shadow.bak /etc/gshadow- /etc/gshadow~ /etc/gshadow.bak",
-            "do", '    rm -rf -- "$path"', '    test ! -e "$path" && test ! -L "$path"', "done",
-            "for path in /etc/passwd- /etc/passwd~ /etc/passwd.bak /etc/group- /etc/group~ /etc/group.bak",
-            "do", '    rm -rf -- "$path"', '    test ! -e "$path" && test ! -L "$path"', "done",
-            "for path in /var/backups/shadow* /var/backups/gshadow* /var/backups/passwd* /var/backups/group*",
-            "do", '    rm -rf -- "$path"', '    test ! -e "$path" && test ! -L "$path"', "done",
-            "for path in /root/.ssh /root/.bash_history /root/.ash_history /root/.zsh_history",
-            "do", '    rm -rf -- "$path"', '    test ! -e "$path" && test ! -L "$path"', "done",
+            "for path in " + " ".join(CREDENTIAL_PATHS),
+            "do", '    parent=${path%/*}',
+            '    if test ! -e "$parent" && test ! -L "$parent"; then continue; fi',
+            '    if ! test -d "$parent" || test "$(readlink -f -- "$parent")" != "$parent"; then exit 1; fi',
+            '    if test "$path" = /root/.ssh; then', '        rm -rf -- "$path"',
+            "    else", '        if test -e "$path" || test -L "$path"; then',
+            '            test -L "$path" || test -f "$path"', "        fi", '        rm -f -- "$path"',
+            "    fi", '    test ! -e "$path" && test ! -L "$path"', "done",
             "for directory in /tmp /var/tmp; do", '    test ! -L "$directory"',
             '    if test -d "$directory"; then',
             '        for path in "$directory"/* "$directory"/.[!.]* "$directory"/..?*; do',
@@ -618,6 +645,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--release")
     parser.add_argument("--ssh-timeout", type=float, default=120)
     parser.add_argument("--agent-timeout", type=float, default=300)
+    parser.add_argument("--package-index-timeout", type=float, default=600)
     args = parser.parse_args(argv)
     if not args.matrix and not all((args.architecture, args.distro, args.release)):
         parser.error("构建必须指定架构、发行版和版本")
@@ -636,7 +664,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                  if spec.distro == args.distro and spec.release == args.release]
         if len(specs) != 1:
             raise ValueError("必须恰好匹配一个清单版本")
-        Pipeline(specs, args.output_dir, ssh_timeout=args.ssh_timeout, agent_timeout=args.agent_timeout).run()
+        Pipeline(specs, args.output_dir, ssh_timeout=args.ssh_timeout, agent_timeout=args.agent_timeout,
+                 package_index_timeout=args.package_index_timeout).run()
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
         print("[错误] 构建失败；如已生成构建摘要，请查看摘要", file=sys.stderr)
         return 1
