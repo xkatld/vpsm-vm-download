@@ -593,6 +593,18 @@ class SetupTests(PipelineTestCase):
         self.assertIn("crb", build_pipeline.Pipeline.package_install_command(spec_for("centos", "10-Stream")))
         self.assertIn("epel-release-latest-10.noarch.rpm", build_pipeline.Pipeline.package_install_command(spec_for("centos", "10-Stream")))
 
+    def test_enterprise_install_retries_after_cache_refresh(self):
+        command = build_pipeline.Pipeline.package_install_command(spec_for("centos", "10-Stream"))
+        self.assertIn("retry_install()", command)
+        self.assertIn('while ! dnf install -y "$@"', command)
+        self.assertIn('if test "$attempt" -gt 3; then exit 1; fi', command)
+        self.assertIn("dnf clean all", command)
+        self.assertIn("retry_install dnf-plugins-core", command)
+        self.assertIn("retry_install epel-release", build_pipeline.Pipeline.package_install_command(spec_for("almalinux", "9")))
+        self.assertNotRegex(command, r"(?m)^dnf install -y ")
+        debian = build_pipeline.Pipeline.package_install_command(spec_for("debian", "bookworm"))
+        self.assertNotIn("retry_install", debian)
+
     def test_ssh_uses_ipv4_and_password_stdin(self):
         pipeline = self.pipeline()
         self.subprocess.return_value = completed("root\n")

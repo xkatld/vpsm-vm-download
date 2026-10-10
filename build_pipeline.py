@@ -375,9 +375,12 @@ class Pipeline:
             repo = "powertools" if major == "8" else "crb"
             epel = (f"https://dl.fedoraproject.org/pub/epel/epel-release-latest-{major}.noarch.rpm"
                     if spec.distro == "centos" else "epel-release")
-            return shell_lines("set -eu", "dnf install -y dnf-plugins-core",
-                               f"dnf config-manager --set-enabled {repo}", f"dnf install -y {epel}",
-                               f"dnf install -y {COMMON_PACKAGES}", "update-ca-trust extract",
+            retry = ('retry_install() { attempt=1; while ! dnf install -y "$@"; do'
+                     ' attempt=$((attempt + 1)); if test "$attempt" -gt 3; then exit 1; fi;'
+                     " dnf clean all; sleep 5; done; }")
+            return shell_lines("set -eu", retry, "retry_install dnf-plugins-core",
+                               f"dnf config-manager --set-enabled {repo}", f"retry_install {epel}",
+                               f"retry_install {COMMON_PACKAGES}", "update-ca-trust extract",
                                "test -s /etc/pki/tls/certs/ca-bundle.crt")
         raise ValueError("不支持的发行版")
 
