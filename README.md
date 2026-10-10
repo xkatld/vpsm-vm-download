@@ -14,7 +14,7 @@
 
 以 [镜像清单](镜像.md) 为准，15 个版本、单架构 amd64，共 15 个单规格虚拟机镜像。上游使用 default，不构建容器或 lite。CentOS Stream 并非传统 CentOS，Debian forky 是开发分支。
 
-预装 SSH，以及 `bash git unzip screen wget curl sudo nano ca-certificates`，镜像说明地址为 `vpsm91.com`。默认规格为双核、2GiB 内存、12GiB 磁盘。
+预装 SSH，以及 `bash git unzip screen wget curl sudo nano ca-certificates`，镜像说明地址为 `vpsm91.com`。默认规格为双核、2GiB 内存、5GB 磁盘。
 
 ## 构建与下载
 

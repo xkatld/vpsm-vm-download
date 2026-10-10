@@ -356,7 +356,7 @@ class Acceptance:
         self.incus([
             "init", self.alias, self.instance, "--vm", "--profile", "default",
             "-c", "security.secureboot=false", "-c", "limits.cpu=2",
-            "-c", "limits.memory=2GiB", "-d", "root,size=12GiB",
+            "-c", "limits.memory=2GiB", "-d", "root,size=5GB",
         ], timeout=180, diagnostic=True)
         self.incus(["config", "device", "add", self.instance, "agent", "disk", "source=agent:config"],
                    diagnostic=True)
@@ -372,7 +372,7 @@ class Acceptance:
         root = devices.get("root") or {}
         nic = devices.get("eth0") or {}
         if (root.get("type") != "disk" or root.get("pool") != "default" or root.get("path") != "/"
-                or root.get("size") != "12GiB"):
+                or root.get("size") != "5GB"):
             raise CheckError("虚拟机根磁盘配置不匹配")
         if nic.get("type") != "nic" or nic.get("network") != "incusbr0" or nic.get("name") != "eth0":
             raise CheckError("虚拟机网卡配置不匹配")

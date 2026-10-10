@@ -279,7 +279,7 @@ class ResourceTests(PipelineTestCase):
                      pipeline.base_alias(spec), "--vm", "--quiet"],
                     ["incus", "init", pipeline.base_alias(spec), name, "--vm",
                      "--config", "security.secureboot=false", "--config", "limits.cpu=2",
-                     "--config", "limits.memory=2GiB", "--device", "root,size=12GiB"],
+                     "--config", "limits.memory=2GiB", "--device", "root,size=5GB"],
                     ["incus", "config", "device", "add", name, "agent", "disk", "source=agent:config"],
                     ["incus", "start", name],
                 ])
@@ -327,7 +327,7 @@ class ResourceTests(PipelineTestCase):
         self.assertEqual(commands, [
             ["incus", "init", pipeline.base_alias(pipeline.specs[0]), name, "--vm",
              "--config", "security.secureboot=false", "--config", "limits.cpu=2",
-             "--config", "limits.memory=2GiB", "--device", "root,size=12GiB"],
+             "--config", "limits.memory=2GiB", "--device", "root,size=5GB"],
             device_command,
             ["incus", "delete", name, "--force"],
         ])

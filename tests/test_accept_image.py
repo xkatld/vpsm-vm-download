@@ -37,7 +37,7 @@ def vm_row(name="vm"):
         "name": name, "status": "Running", "type": "virtual-machine",
         "expanded_config": {"security.secureboot": "false", "limits.cpu": "2", "limits.memory": "2GiB"},
         "expanded_devices": {
-            "root": {"type": "disk", "pool": "default", "path": "/", "size": "12GiB"},
+            "root": {"type": "disk", "pool": "default", "path": "/", "size": "5GB"},
             "eth0": {"type": "nic", "network": "incusbr0", "name": "eth0", "hwaddr": "00:16:3e:12:34:56"},
         },
         "state": {"network": {
@@ -172,7 +172,7 @@ class AcceptanceTests(unittest.TestCase):
             ["config", "device", "add", acceptance.instance, "agent", "disk", "source=agent:config"],
             diagnostic=True))
         self.assertTrue(incus.call_args_list[0].kwargs["diagnostic"])
-        for setting in ("security.secureboot=false", "limits.cpu=2", "limits.memory=2GiB", "root,size=12GiB"):
+        for setting in ("security.secureboot=false", "limits.cpu=2", "limits.memory=2GiB", "root,size=5GB"):
             self.assertIn(setting, args)
         self.assertFalse(any("security.privileged" in arg for arg in args))
 
