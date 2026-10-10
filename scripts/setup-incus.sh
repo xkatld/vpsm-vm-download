@@ -30,7 +30,7 @@ fi
 sudo systemctl start incus
 sudo timeout 120 incus admin waitready
 server_version=$(sudo incus query /1.0 | python3 -I -c 'import json, sys; print(json.load(sys.stdin)["environment"]["server_version"])')
-client_version=$(incus --version)
+client_version=$(sudo incus --version)
 case "$server_version" in 7.5 | 7.5.*) : ;; *)
   printf '%s\n' "incus 服务端版本不符合要求：${server_version}，需要 7.5 系列" >&2
   exit 1;;
