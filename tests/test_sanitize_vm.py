@@ -8,6 +8,7 @@ from unittest.mock import patch
 from scripts import sanitize_vm
 from scripts.image_cleanup import (
     ACCOUNT_BACKUP_SUFFIXES, ACCOUNT_FILES, CREDENTIAL_DIRECTORIES, CREDENTIAL_PATHS, HISTORY_FILES,
+    PROVISION_CONF, PROVISION_MASK,
 )
 
 
@@ -93,6 +94,16 @@ class FakeGuest:
 
     def ln_sf(self, target, path):
         self.links[path] = target
+
+    def read_file(self, path):
+        return self.files[self.links.get(path, path)]
+
+    def mkdir_p(self, path):
+        current = ""
+        for part in path.split("/"):
+            if part:
+                current += "/" + part
+                self.directories.add(current)
 
     def glob_expand(self, pattern):
         return [path for path in set(self.files) | set(self.links) | self.directories if fnmatch.fnmatchcase(path, pattern)]
@@ -185,6 +196,40 @@ class SanitizeVmTests(unittest.TestCase):
             sanitize_vm.sanitize_disk(self.disk)
         self.assertEqual(self.guest.files["/var/backups/passwd.archive/keep"], b"keep")
         self.assertNotIn(("rm_rf", "/var/backups/passwd.archive"), self.guest.calls)
+
+    def test_provision_conf_with_ssh_rule_is_masked(self):
+        content = b"d- /root :0700 root :root -\nd- /root/.ssh :0700 root :root -\n"
+        self.guest.files[PROVISION_CONF] = content
+        sanitize_vm.sanitize_disk(self.disk)
+        self.assertEqual(self.guest.files[PROVISION_CONF], content)
+        self.assertEqual(self.guest.files[PROVISION_MASK], b"")
+        self.assertIn("/etc/tmpfiles.d", self.guest.directories)
+
+    def test_provision_conf_without_ssh_rule_is_preserved(self):
+        self.guest.files[PROVISION_CONF] = b"d /run/example 0755 root root -\n"
+        sanitize_vm.sanitize_disk(self.disk)
+        self.assertNotIn(PROVISION_MASK, self.guest.files)
+
+    def test_provision_conf_link_is_rejected(self):
+        self.guest.links[PROVISION_CONF] = "/etc/shadow"
+        with self.assertRaises(ValueError):
+            sanitize_vm.sanitize_disk(self.disk)
+        self.assertNotIn(PROVISION_MASK, self.guest.files)
+
+    def test_provision_mask_link_is_rejected(self):
+        self.guest.directories.add("/etc/tmpfiles.d")
+        self.guest.files[PROVISION_CONF] = b"d- /root/.ssh :0700 root :root -\n"
+        self.guest.links[PROVISION_MASK] = "/etc/shadow"
+        with self.assertRaises(ValueError):
+            sanitize_vm.sanitize_disk(self.disk)
+        self.assertEqual(self.guest.files["/etc/shadow"], b"preserved")
+
+    def test_provision_mask_must_stay_empty(self):
+        self.guest.directories.add("/etc/tmpfiles.d")
+        self.guest.files[PROVISION_CONF] = b"d /run/example 0755 root root -\n"
+        self.guest.files[PROVISION_MASK] = b"d- /root/.ssh :0700 root :root -\n"
+        with self.assertRaises(ValueError):
+            sanitize_vm.sanitize_disk(self.disk)
 
     def test_root_parent_link_rejected(self):
         self.guest.links["/root"] = "/etc"

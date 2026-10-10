@@ -6,6 +6,8 @@ HISTORY_FILES = (
     "/root/.history", "/root/.lesshst", "/root/.local/share/fish/fish_history",
 )
 CREDENTIAL_DIRECTORIES = ("/root/.ssh",)
+PROVISION_CONF = "/usr/lib/tmpfiles.d/provision.conf"
+PROVISION_MASK = "/etc/tmpfiles.d/provision.conf"
 CREDENTIAL_PATHS = (
     *(f"/etc/{name}{suffix}" for name in ACCOUNT_FILES for suffix in ACCOUNT_BACKUP_SUFFIXES),
     *(f"/var/backups/{name}*" for name in ACCOUNT_FILES),

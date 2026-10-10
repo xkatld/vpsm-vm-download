@@ -644,6 +644,10 @@ class SetupTests(PipelineTestCase):
             pipeline.cleanup_containers()
         command = execute.call_args.args[1]
         self.assertIn("root:!", command)
+        self.assertIn("/usr/lib/tmpfiles.d/provision.conf", command)
+        self.assertIn("/etc/tmpfiles.d/provision.conf", command)
+        self.assertIn('grep -qF -- /root/.ssh "$provision"', command)
+        self.assertIn(': > "$mask"', command)
         self.assertIn("/etc/shadow.bak", command)
         self.assertIn("/var/backups/group*", command)
         self.assertIn('"$directory"/.[!.]*', command)

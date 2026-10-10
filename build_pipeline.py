@@ -467,10 +467,20 @@ class Pipeline:
         )
 
     def cleanup_containers(self) -> None:
-        from scripts.image_cleanup import CREDENTIAL_PATHS
+        from scripts.image_cleanup import CREDENTIAL_PATHS, PROVISION_CONF, PROVISION_MASK
 
         common = shell_lines(
             "set -eu", "printf 'root:!\\n' | chpasswd -e",
+            "provision=" + PROVISION_CONF, "mask=" + PROVISION_MASK, "confdir=${mask%/*}",
+            'if test -e "$provision" || test -L "$provision"; then',
+            '    test -f "$provision" && test ! -L "$provision"',
+            '    grep -qF -- /root/.ssh "$provision"',
+            '    if test -e "$confdir" || test -L "$confdir"; then',
+            '        test -d "$confdir" && test "$(readlink -f -- "$confdir")" = "$confdir"',
+            "    else", '        mkdir -p "$confdir"', "    fi",
+            '    test ! -L "$mask"',
+            '    if test -e "$mask"; then', '        test -f "$mask"', "    fi",
+            '    : > "$mask"', '    test ! -s "$mask"', "fi",
             "for path in " + " ".join(CREDENTIAL_PATHS),
             "do", '    parent=${path%/*}',
             '    if test ! -e "$parent" && test ! -L "$parent"; then continue; fi',

@@ -4,7 +4,7 @@ import fnmatch
 import importlib
 from pathlib import Path, PurePosixPath
 
-from scripts.image_cleanup import CREDENTIAL_DIRECTORIES, CREDENTIAL_PATHS
+from scripts.image_cleanup import CREDENTIAL_DIRECTORIES, CREDENTIAL_PATHS, PROVISION_CONF, PROVISION_MASK
 from scripts.vm_image import validate_disk
 
 
@@ -89,6 +89,18 @@ def sanitize_disk(path: Path) -> None:
                     raise ValueError("消息总线身份文件类型错误")
                 guest.rm(dbus_id)
             guest.ln_sf("/etc/machine-id", dbus_id)
+        if guest.exists(PROVISION_CONF) or guest.is_symlink(PROVISION_CONF):
+            if guest.is_symlink(PROVISION_CONF) or not guest.is_file(PROVISION_CONF):
+                raise ValueError("tmpfiles 配置不是普通文件")
+            if b"/root/.ssh" in guest.read_file(PROVISION_CONF):
+                mask_dir = str(PurePosixPath(PROVISION_MASK).parent)
+                if guest.is_symlink(mask_dir):
+                    raise ValueError("tmpfiles 掩蔽目录包含符号链接")
+                if not guest.is_dir(mask_dir):
+                    guest.mkdir_p(mask_dir)
+                if guest.is_symlink(PROVISION_MASK) or guest.exists(PROVISION_MASK) and not guest.is_file(PROVISION_MASK):
+                    raise ValueError("tmpfiles 掩蔽路径类型错误")
+                guest.write(PROVISION_MASK, b"")
         targets = cleanup_targets(guest)
         for target in sorted(targets):
             if not safe_parent(guest, target):
@@ -112,6 +124,9 @@ def sanitize_disk(path: Path) -> None:
         for target in targets | cleanup_targets(guest):
             if safe_parent(guest, target) and (guest.exists(target) or guest.is_symlink(target)):
                 raise ValueError("身份密钥、账号备份或历史记录仍存在")
+        if guest.exists(PROVISION_MASK) or guest.is_symlink(PROVISION_MASK):
+            if guest.is_symlink(PROVISION_MASK) or not guest.is_file(PROVISION_MASK) or guest.filesize(PROVISION_MASK) != 0:
+                raise ValueError("tmpfiles 掩蔽文件无效")
         guest.sync()
         guest.shutdown()
         launched = False
