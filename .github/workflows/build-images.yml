@@ -27,7 +27,7 @@ jobs:
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
       - name: 执行单元与语法检查
@@ -66,7 +66,7 @@ jobs:
       PYTHONUNBUFFERED: '1'
       LIBGUESTFS_BACKEND: direct
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
       - name: 检查虚拟化能力并初始化
@@ -149,7 +149,7 @@ jobs:
       contents: read
       actions: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
       - name: 确认全部构建验收成功
