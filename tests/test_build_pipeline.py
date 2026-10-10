@@ -264,20 +264,27 @@ class PreflightTests(PipelineTestCase):
 
 class ResourceTests(PipelineTestCase):
     def test_vm_copy_init_and_resource_limits(self):
-        pipeline = self.pipeline()
-        with patch.object(pipeline, "wait_for_container") as wait:
-            pipeline.download_images()
-            pipeline.launch_containers()
-        commands = [item.args[0] for item in self.subprocess.call_args_list]
-        self.assertIn("--vm", commands[0])
-        self.assertIn("--vm", commands[1])
-        self.assertIn("security.secureboot=false", commands[1])
-        self.assertIn("limits.cpu=2", commands[1])
-        self.assertIn("limits.memory=2GiB", commands[1])
-        self.assertIn("root,size=12GiB", commands[1])
-        self.assertEqual(commands[2], ["incus", "start", pipeline.container_name(self.spec)])
-        wait.assert_called_once_with(pipeline.container_name(self.spec))
-        self.assertEqual(pipeline.created_containers, [pipeline.container_name(self.spec)])
+        for distro, release in RELEASES:
+            with self.subTest(distro=distro, release=release):
+                self.subprocess.reset_mock()
+                spec = spec_for(distro, release)
+                pipeline = self.pipeline(specs=[spec])
+                name = pipeline.container_name(spec)
+                with patch.object(pipeline, "wait_for_container") as wait:
+                    pipeline.download_images()
+                    pipeline.launch_containers()
+                commands = [item.args[0] for item in self.subprocess.call_args_list]
+                self.assertEqual(commands, [
+                    ["incus", "image", "copy", spec.remote_path(), "local:", "--alias",
+                     pipeline.base_alias(spec), "--vm", "--quiet"],
+                    ["incus", "init", pipeline.base_alias(spec), name, "--vm",
+                     "--config", "security.secureboot=false", "--config", "limits.cpu=2",
+                     "--config", "limits.memory=2GiB", "--device", "root,size=12GiB"],
+                    ["incus", "config", "device", "add", name, "agent", "disk", "source=agent:config"],
+                    ["incus", "start", name],
+                ])
+                wait.assert_called_once_with(name)
+                self.assertEqual(pipeline.created_containers, [name])
 
     def test_unique_bounded_names(self):
         first, second = self.pipeline(), self.pipeline()
@@ -294,11 +301,48 @@ class ResourceTests(PipelineTestCase):
         pipeline.final_cleanup()
         self.subprocess.assert_not_called()
 
+    def test_device_failure_blocks_start_and_run_cleans_owned_instance(self):
+        pipeline = self.pipeline(specs=[spec_for("almalinux", "10")])
+        name = pipeline.container_name(pipeline.specs[0])
+        device_command = ["incus", "config", "device", "add", name, "agent", "disk", "source=agent:config"]
+
+        def execute(command, **kwargs):
+            if command[1] == "init":
+                self.assertEqual(pipeline.created_containers, [])
+            if command == device_command:
+                self.assertEqual(pipeline.created_containers, [name])
+                raise subprocess.CalledProcessError(1, command, stderr="代理配置盘添加失败")
+            return completed()
+
+        self.subprocess.side_effect = execute
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(pipeline, "preflight"))
+            stack.enter_context(patch.object(pipeline, "download_images"))
+            wait = stack.enter_context(patch.object(pipeline, "wait_for_container"))
+            setup = stack.enter_context(patch.object(pipeline, "setup_containers"))
+            summary = stack.enter_context(patch.object(pipeline, "write_summary"))
+            with self.assertRaisesRegex(RuntimeError, "代理配置盘添加失败"):
+                pipeline.run()
+        commands = [item.args[0] for item in self.subprocess.call_args_list]
+        self.assertEqual(commands, [
+            ["incus", "init", pipeline.base_alias(pipeline.specs[0]), name, "--vm",
+             "--config", "security.secureboot=false", "--config", "limits.cpu=2",
+             "--config", "limits.memory=2GiB", "--device", "root,size=12GiB"],
+            device_command,
+            ["incus", "delete", name, "--force"],
+        ])
+        wait.assert_not_called()
+        setup.assert_not_called()
+        summary.assert_called_once()
+        self.assertEqual(summary.call_args.args[0], "failed")
+        self.assertEqual(pipeline.created_containers, [])
+
     def test_start_failure_preserves_owned_instance_for_cleanup(self):
         pipeline = self.pipeline()
-        self.subprocess.side_effect = [completed(), subprocess.CalledProcessError(1, ["incus"])]
+        self.subprocess.side_effect = [completed(), completed(), subprocess.CalledProcessError(1, ["incus"])]
         with self.assertRaises(build_pipeline.IncusCommandError):
             pipeline.launch_containers()
+        self.assertEqual(self.subprocess.call_args.args[0], ["incus", "start", pipeline.container_name(self.spec)])
         self.assertEqual(pipeline.created_containers, [pipeline.container_name(self.spec)])
 
     def test_cleanup_deletes_only_recorded_instances_and_aliases(self):

@@ -145,11 +145,166 @@ class AcceptanceTests(unittest.TestCase):
         acceptance = self.acceptance
         with patch.object(acceptance, "incus", return_value=completed()) as incus:
             acceptance.init_instance()
-        args = incus.call_args.args[0]
+        args = incus.call_args_list[0].args[0]
         self.assertEqual(args[:4], ["init", acceptance.alias, acceptance.instance, "--vm"])
+        self.assertEqual(incus.call_args_list[1], call(
+            ["config", "device", "add", acceptance.instance, "agent", "disk", "source=agent:config"],
+            diagnostic=True))
+        self.assertTrue(incus.call_args_list[0].kwargs["diagnostic"])
         for setting in ("security.secureboot=false", "limits.cpu=2", "limits.memory=2GiB", "root,size=12GiB"):
             self.assertIn(setting, args)
         self.assertFalse(any("security.privileged" in arg for arg in args))
+
+    def test_init_failure_never_adds_agent_disk(self):
+        acceptance = self.acceptance
+        with patch.object(acceptance, "incus", side_effect=CheckError("创建失败")) as incus:
+            with self.assertRaises(CheckError):
+                acceptance.init_instance()
+        incus.assert_called_once()
+
+    def test_agent_disk_precedes_primary_and_clone_start(self):
+        acceptance = self.acceptance
+        with ExitStack() as stack:
+            incus = stack.enter_context(patch.object(acceptance, "incus", return_value=completed()))
+            for method in ("agent_ready", "check_vm_config", "network_ready", "check_root_lock",
+                           "check_credential_backups", "check_boot"):
+                stack.enter_context(patch.object(acceptance, method))
+            stack.enter_context(patch.object(acceptance, "sample_identity", return_value=identity(2)))
+            acceptance.init_instance()
+            acceptance.boot_ready("cold")
+            acceptance.check_clone(identity(1))
+        calls = [item.args[0] for item in incus.call_args_list]
+        for name in (acceptance.instance, acceptance.clone_instance):
+            init_index = next(index for index, args in enumerate(calls) if args[:3] == ["init", acceptance.alias, name])
+            device_index = calls.index(["config", "device", "add", name, "agent", "disk", "source=agent:config"])
+            self.assertEqual(device_index, init_index + 1)
+            self.assertLess(device_index, calls.index(["start", name]))
+
+    def test_opt_in_diagnostics_preserve_stderr_without_secrets(self):
+        with patch.dict("scripts.accept_image.os.environ", {"SSHPASS": "继承登录口令", "IMAGE_ROOT_PASSWORD": "继承镜像口令"}):
+            acceptance = Acceptance(self.spec, Path("dist"), Path("acceptance"))
+        first = acceptance.password
+        acceptance.password = "克隆随机口令"
+        acceptance.diagnostic_secrets.add(acceptance.password)
+        stderr = ("无法访问虚拟化设备\n" + "\n".join((first, acceptance.password, "继承登录口令", "继承镜像口令"))
+                  + "\n\x1b[31m错误\x1b[0m\r\x00\n::error::命令注入\n" + chr(35) * 2 + "[标记\n" + "长" * 4000)
+        exception = subprocess.CalledProcessError(42, ["绝不显示参数"], output="绝不显示标准输出", stderr=stderr)
+        with patch("scripts.accept_image.subprocess.run", side_effect=exception):
+            with patch("builtins.print") as output:
+                with self.assertRaises(CheckError) as caught:
+                    acceptance.step("cold-start", lambda: acceptance.incus(["start", acceptance.instance], diagnostic=True))
+        message = str(caught.exception)
+        self.assertIn("42", message)
+        self.assertIn("无法访问虚拟化设备", message)
+        self.assertLess(len(message), acceptance.STDERR_LIMIT + 100)
+        emitted = message + json.dumps(acceptance.report, ensure_ascii=False) + str(output.call_args_list)
+        for hidden in (first, acceptance.password, "继承登录口令", "继承镜像口令", "绝不显示参数", "绝不显示标准输出",
+                       "::", chr(35) * 2 + "[", "\x1b", "\r", "\x00", "Traceback"):
+            self.assertNotIn(hidden, emitted)
+        self.assertTrue(caught.exception.__suppress_context__)
+        self.assertEqual(acceptance.report["error"]["stage"], "cold-start")
+
+    def test_command_diagnostics_are_explicit_and_forbid_credentials(self):
+        acceptance = self.acceptance
+        cases = (
+            (["start", acceptance.instance], {}),
+            (["exec", acceptance.instance, "--", "chpasswd"], {"diagnostic": True, "input": "绝不显示输入"}),
+            (["start", acceptance.instance], {"diagnostic": True, "password": True}),
+            (["exec", acceptance.instance, "--", "cat", "/etc/shadow"], {"diagnostic": True}),
+        )
+        for args, kwargs in cases:
+            with self.subTest(args=args):
+                error = subprocess.CalledProcessError(7, ["绝不显示参数"], output="绝不显示输出", stderr="绝不显示错误")
+                with patch("scripts.accept_image.subprocess.run", side_effect=error):
+                    with patch("builtins.print") as output:
+                        with self.assertRaises(subprocess.CalledProcessError):
+                            acceptance.step("test-password", lambda: acceptance.incus(args, **kwargs))
+                emitted = json.dumps(acceptance.report, ensure_ascii=False) + str(output.call_args_list)
+                self.assertNotIn("绝不显示", emitted)
+        with patch("scripts.accept_image.subprocess.run", side_effect=error):
+            with self.assertRaises(subprocess.CalledProcessError):
+                acceptance.command(["sshpass", "-e", "ssh", "root@主机"], diagnostic=True)
+
+    def test_diagnostic_timeout_retains_safe_stderr_only(self):
+        acceptance = self.acceptance
+        error = subprocess.TimeoutExpired(["禁止显示参数"], 10, output=b"hidden output", stderr="等待虚拟化设备".encode())
+        with patch("scripts.accept_image.subprocess.run", side_effect=error):
+            with self.assertRaises(CheckError) as caught:
+                acceptance.incus(["start", acceptance.instance], diagnostic=True)
+        self.assertIn("等待虚拟化设备", str(caught.exception))
+        self.assertNotIn("禁止显示参数", str(caught.exception))
+        self.assertNotIn("hidden output", str(caught.exception))
+
+    def test_diagnostics_only_collect_owned_instances_and_safe_config(self):
+        acceptance = self.acceptance
+        acceptance.project_created = True
+        acceptance.report_ready = True
+        acceptance.deadline = 145
+        row = vm_row(acceptance.instance)
+        row["expanded_config"].update({"user.certificate": "配置证书机密", "volatile.token": "配置令牌机密",
+                                       "image.os": "Debian", "image.custom": "镜像任意机密"})
+        row["expanded_devices"]["agent"] = {"type": "disk", "source": "agent:config"}
+        row["expanded_devices"]["root"]["source"] = "磁盘敏感来源"
+        rows = [row, vm_row("external-vm"), vm_row("../路径逃逸"), vm_row("remote:vm")]
+        log = ("固件启动失败\n" + acceptance.password + "\n配置证书机密\n配置令牌机密\n镜像任意机密\n"
+               "token=日志令牌机密\n\x1b[31m设备错误\x1b[0m\r\x00\n::error::不执行\n"
+               + chr(35) * 2 + "[不执行\n" + "长" * 20000)
+        def respond(args, **kwargs):
+            self.assertEqual(args[:3], ["incus", "--project", acceptance.project])
+            self.assertLessEqual(kwargs["timeout"], 10)
+            return completed(json.dumps(rows) if args[3:] == ["list", "--format", "json"] else log)
+        with ExitStack() as stack:
+            stack.enter_context(patch("scripts.accept_image.time.monotonic", return_value=100))
+            run = stack.enter_context(patch("scripts.accept_image.subprocess.run", side_effect=respond))
+            stack.enter_context(patch.object(Path, "mkdir"))
+            write = stack.enter_context(patch.object(Path, "write_text"))
+            acceptance.collect_diagnostics()
+        self.assertEqual([item.args[0][3:] for item in run.call_args_list], [
+            ["list", "--format", "json"], ["info", acceptance.instance, "--show-log"],
+            ["console", acceptance.instance, "--show-log"],
+        ])
+        self.assertEqual(write.call_count, 3)
+        config = json.loads(write.call_args_list[0].args[0])
+        self.assertEqual(config["config"]["security.secureboot"], "false")
+        self.assertEqual(config["config"]["image.os"], "Debian")
+        self.assertEqual(config["devices"]["agent"]["source"], "agent:config")
+        emitted = "\n".join(item.args[0] for item in write.call_args_list)
+        for hidden in (acceptance.password, "user.certificate", "volatile.token", "配置证书机密", "配置令牌机密",
+                       "镜像任意机密", "日志令牌机密", "磁盘敏感来源", "::", chr(35) * 2 + "[", "\x1b", "\r", "\x00"):
+            self.assertNotIn(hidden, emitted)
+        self.assertIn("固件启动失败", emitted)
+        self.assertIn("\\u000d", emitted)
+        self.assertIn("\\u0000", emitted)
+        self.assertTrue(all(len(item.args[0].encode()) <= 65536 for item in write.call_args_list))
+        self.assertTrue(all(path.startswith("diagnostics/") for path in acceptance.report["diagnostics"]["files"]))
+
+    def test_diagnostics_skip_uncreated_project_and_unready_report(self):
+        acceptance = self.acceptance
+        for project_created, report_ready in ((False, True), (True, False), (False, False)):
+            acceptance.project_created, acceptance.report_ready = project_created, report_ready
+            with patch.object(acceptance, "incus") as incus:
+                with patch.object(Path, "mkdir") as mkdir:
+                    acceptance.collect_diagnostics()
+            incus.assert_not_called()
+            mkdir.assert_not_called()
+
+    def test_diagnostics_continue_after_log_failure_and_respect_deadline(self):
+        acceptance = self.acceptance
+        acceptance.project_created = acceptance.report_ready = True
+        acceptance.deadline = 145
+        rows = json.dumps([vm_row(acceptance.instance)])
+        for expired in (False, True):
+            with self.subTest(expired=expired):
+                with ExitStack() as stack:
+                    stack.enter_context(patch.object(Path, "mkdir"))
+                    stack.enter_context(patch.object(Path, "write_text"))
+                    stack.enter_context(patch("scripts.accept_image.time.monotonic", return_value=146 if expired else 100))
+                    incus = stack.enter_context(patch.object(acceptance, "incus", side_effect=[
+                        completed(rows), subprocess.CalledProcessError(1, ["隐藏"], stderr="隐藏"), completed("控制台错误"),
+                    ]))
+                    acceptance.collect_diagnostics()
+                self.assertEqual(incus.call_count, 1 if expired else 3)
+        self.assertNotIn("隐藏", json.dumps(acceptance.report, ensure_ascii=False))
 
     def test_vm_configuration_requires_vm_and_secureboot_false(self):
         acceptance = self.acceptance
@@ -307,6 +462,12 @@ class AcceptanceTests(unittest.TestCase):
         self.assertFalse(any("copy" in entry or "publish" in entry or "--force" in entry for entry in args))
         self.assertEqual(acceptance.instance, primary)
         self.assertEqual(acceptance.password, password)
+        clone_password = next(item.kwargs["input"].removeprefix("root:").rstrip("\n")
+                              for item in incus.call_args_list if "input" in item.kwargs)
+        self.assertNotEqual(clone_password, password)
+        self.assertIn(clone_password, acceptance.diagnostic_secrets)
+        self.assertIn(password, acceptance.diagnostic_secrets)
+        self.assertNotIn(clone_password, acceptance.diagnostic_text(clone_password, 2048))
 
     def test_cleanup_never_touches_unowned_project(self):
         with patch.object(self.acceptance, "incus") as incus:
@@ -397,7 +558,7 @@ class AcceptanceTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 main(["--distro", "debian", "--release", "bookworm", "--architecture", "arm64"])
 
-    def lifecycle(self, failure=None, cleanup_success=True):
+    def lifecycle(self, failure=None, cleanup_success=True, diagnostic_error=None):
         acceptance = self.acceptance
         stages = []
         original_step = acceptance.step
@@ -408,6 +569,12 @@ class AcceptanceTests(unittest.TestCase):
             return original_step(label, action)
         def report_ready():
             acceptance.report_ready = True
+        def project_created():
+            acceptance.project_created = True
+        def collect_diagnostics():
+            stages.append("diagnostics")
+            if diagnostic_error is not None:
+                raise diagnostic_error
         with ExitStack() as stack:
             stack.enter_context(patch("scripts.accept_image.signal.signal"))
             timer = stack.enter_context(patch("scripts.accept_image.signal.setitimer"))
@@ -415,7 +582,9 @@ class AcceptanceTests(unittest.TestCase):
             stack.enter_context(patch("scripts.accept_image.check_os_release"))
             stack.enter_context(patch.object(acceptance, "step", side_effect=step))
             stack.enter_context(patch.object(acceptance, "prepare_report", side_effect=report_ready))
-            for name in ("preflight", "create_project", "check_vm_config", "agent_ready", "check_packages",
+            stack.enter_context(patch.object(acceptance, "create_project", side_effect=project_created))
+            stack.enter_context(patch.object(acceptance, "collect_diagnostics", side_effect=collect_diagnostics))
+            for name in ("preflight", "check_vm_config", "agent_ready", "check_packages",
                          "check_readme", "check_root_lock", "check_credential_backups"):
                 stack.enter_context(patch.object(acceptance, name))
             incus = stack.enter_context(patch.object(acceptance, "incus", return_value=completed()))
@@ -459,6 +628,26 @@ class AcceptanceTests(unittest.TestCase):
                 cleanup.assert_called_once()
                 report.assert_called_once()
                 self.assertEqual(self.acceptance.report["error"]["stage"], phase)
+
+    def test_failure_collects_diagnostics_before_cleanup_without_overwriting_error(self):
+        for error in (None, OSError("诊断私密异常"), AcceptanceTerminated()):
+            self.setUp()
+            with self.subTest(error=type(error).__name__):
+                result, stages, incus, cleanup, report, timer = self.lifecycle(failure="cold-start", diagnostic_error=error)
+                self.assertEqual(result, 1)
+                self.assertEqual(stages[-3:], ["diagnostics", "cleanup", "report"])
+                self.assertEqual(self.acceptance.report["error"]["stage"], "cold-start")
+                self.assertEqual([item.args[1] for item in timer.call_args_list], [1500, 0, 45, 0, 90, 0])
+                self.assertNotIn("诊断私密异常", json.dumps(self.acceptance.report, ensure_ascii=False))
+                cleanup.assert_called_once()
+                report.assert_called_once()
+
+    def test_failed_project_creation_and_success_skip_diagnostics(self):
+        for failure in (None, "create-project", "verify-export"):
+            self.setUp()
+            result, stages, incus, cleanup, report, timer = self.lifecycle(failure=failure)
+            self.assertNotIn("diagnostics", stages)
+            cleanup.assert_called_once()
 
     def test_cleanup_failure_prevents_success(self):
         result, stages, incus, cleanup, report, timer = self.lifecycle(cleanup_success=False)

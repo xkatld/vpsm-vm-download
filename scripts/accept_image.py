@@ -192,6 +192,9 @@ class Acceptance:
     AGENT_TIMEOUT = 240
     OVERALL_TIMEOUT = 25 * 60
     CLEANUP_TIMEOUT = 90
+    DIAGNOSTICS_TIMEOUT = 45
+    DIAGNOSTIC_LIMIT = 12000
+    STDERR_LIMIT = 2048
     STAGES = (
         "report-directory", "preflight", "verify-export", "create-project", "profile-root",
         "profile-network", "import-image", "create-instance", "cold-start", "cold-agent",
@@ -213,11 +216,14 @@ class Acceptance:
         self.project = "vpsm-vm-accept-" + suffix
         self.instance = "accept-" + suffix
         self.clone_instance = "clone-" + suffix
+        self.owned_instance_names = {self.instance, self.clone_instance}
         self.alias = "export-" + suffix
         self.project_created = False
         self.report_ready = False
         self.deadline: float | None = None
         self.password = secrets.token_urlsafe(32)
+        self.diagnostic_secrets = {self.password}
+        self.diagnostic_secrets.update(os.environ.get(key, "") for key in ("SSHPASS", "IMAGE_ROOT_PASSWORD"))
         self.report = {
             "status": "failed", "started_at": datetime.now(timezone.utc).isoformat(),
             "steps": [{"stage": stage, "status": "NOT_RUN"} for stage in self.STAGES],
@@ -244,8 +250,29 @@ class Acceptance:
         record["status"] = "PASS"
         return result
 
+    def diagnostic_text(self, value: str | bytes | None, limit: int) -> str:
+        text = value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value or ""
+        secrets_to_hide = self.diagnostic_secrets | {self.password}
+        secrets_to_hide.update(os.environ.get(key, "") for key in ("SSHPASS", "IMAGE_ROOT_PASSWORD"))
+        for secret in sorted(filter(None, secrets_to_hide), key=len, reverse=True):
+            text = text.replace(secret, "[已隐藏]")
+            text = text.replace(json.dumps(secret, ensure_ascii=False)[1:-1], "[已隐藏]")
+        text = re.sub(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\|$)", "", text)
+        text = re.sub(r"(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]", "", text)
+        for secret in sorted(filter(None, secrets_to_hide), key=len, reverse=True):
+            text = text.replace(secret, "[已隐藏]")
+        text = re.sub(r"-----BEGIN [^-]*?(?:PRIVATE KEY|CERTIFICATE)-----.*?(?:-----END [^-]+-----|$)",
+                      "[已隐藏]", text, flags=re.DOTALL)
+        text = re.sub(r"(?im)^.*(?:password|passwd|sshpass|token|credential|secret|authorization|user\.|volatile\.)[^\n]*$",
+                      "[已隐藏敏感行]", text)
+        text = text.replace("::", "：：").replace(chr(35) * 2 + "[", "[已移除标记]")
+        text = "".join(character if character == "\n" or character.isprintable()
+                       else f"\\u{ord(character):04x}" for character in text)
+        return text[:limit] + ("\n[已截断]" if len(text) > limit else "")
+
     def command(self, args: Sequence[str], *, input: str | None = None,
-                timeout: float = 60, password: bool = False) -> subprocess.CompletedProcess:
+                timeout: float = 60, password: bool = False,
+                diagnostic: bool = False) -> subprocess.CompletedProcess:
         if self.deadline is not None:
             remaining = self.deadline - time.monotonic()
             if remaining <= 0:
@@ -255,8 +282,23 @@ class Acceptance:
                        if key not in {"IMAGE_ROOT_PASSWORD", "SSHPASS"}}
         if password:
             environment["SSHPASS"] = self.password
-        return subprocess.run(list(args), input=input, text=True, capture_output=True,
-                              check=True, timeout=timeout, env=environment)
+        diagnostic = diagnostic and input is None and not password and list(args[:3]) == [
+            "incus", "--project", self.project] and (
+                list(args[3:4]) in (["init"], ["start"], ["stop"])
+                or list(args[3:6]) in (["config", "device", "add"], ["profile", "device", "add"]))
+        try:
+            return subprocess.run(list(args), input=input, text=True, capture_output=True,
+                                  check=True, timeout=timeout, env=environment)
+        except subprocess.CalledProcessError as exc:
+            if diagnostic:
+                stderr = self.diagnostic_text(exc.stderr, self.STDERR_LIMIT)
+                raise CheckError(f"命令执行失败，退出码 {exc.returncode}：{stderr or '无标准错误输出'}") from None
+            raise
+        except subprocess.TimeoutExpired as exc:
+            if diagnostic:
+                stderr = self.diagnostic_text(exc.stderr, self.STDERR_LIMIT)
+                raise CheckError(f"命令执行超时：{stderr or '无标准错误输出'}") from None
+            raise
 
     def incus(self, args: Sequence[str], **kwargs) -> subprocess.CompletedProcess:
         return self.command(["incus", "--project", self.project, *args], **kwargs)
@@ -289,7 +331,8 @@ class Acceptance:
             valid_release = spec.release in {"8", "9", "10"}
         if not valid_release:
             raise CheckError("不支持指定发行版或版本")
-        for timeout in (self.READY_TIMEOUT, self.AGENT_TIMEOUT, self.OVERALL_TIMEOUT, self.CLEANUP_TIMEOUT):
+        for timeout in (self.READY_TIMEOUT, self.AGENT_TIMEOUT, self.OVERALL_TIMEOUT,
+                        self.DIAGNOSTICS_TIMEOUT, self.CLEANUP_TIMEOUT):
             if not math.isfinite(timeout) or timeout <= 0:
                 raise CheckError("验收时限必须为有限正数")
         packages = COMMON_PACKAGES.split()
@@ -312,7 +355,9 @@ class Acceptance:
             "init", self.alias, self.instance, "--vm", "--profile", "default",
             "-c", "security.secureboot=false", "-c", "limits.cpu=2",
             "-c", "limits.memory=2GiB", "-d", "root,size=12GiB",
-        ], timeout=180)
+        ], timeout=180, diagnostic=True)
+        self.incus(["config", "device", "add", self.instance, "agent", "disk", "source=agent:config"],
+                   diagnostic=True)
 
     def check_vm_config(self) -> None:
         row = instance_row(self.incus(["list", self.instance, "--format", "json"]).stdout, self.instance)
@@ -455,16 +500,17 @@ class Acceptance:
             raise CheckError("两个独立虚拟机的主机公钥重复")
 
     def boot_ready(self, phase: str) -> dict[str, str]:
-        self.step(phase + "-start", lambda: self.incus(["start", self.instance], timeout=120))
+        self.step(phase + "-start", lambda: self.incus(["start", self.instance], timeout=120, diagnostic=True))
         self.step(phase + "-agent", self.agent_ready)
         self.step(phase + "-vm-config", self.check_vm_config)
         return self.step(phase + "-network", lambda: self.network_ready(phase))
 
     def check_clone(self, primary_identity: dict) -> None:
-        self.step("primary-stop", lambda: self.incus(["stop", self.instance, "--timeout", "60"], timeout=90))
+        self.step("primary-stop", lambda: self.incus(["stop", self.instance, "--timeout", "60"], timeout=90, diagnostic=True))
         primary_instance, primary_password = self.instance, self.password
         self.instance = self.clone_instance
         self.password = secrets.token_urlsafe(32)
+        self.diagnostic_secrets.update((primary_password, self.password))
         try:
             self.step("create-clone", self.init_instance)
             addresses = self.boot_ready("clone")
@@ -476,6 +522,86 @@ class Acceptance:
             self.step("identity-uniqueness", lambda: self.check_identity_uniqueness(primary_identity, identity))
         finally:
             self.instance, self.password = primary_instance, primary_password
+
+    def collect_diagnostics(self) -> None:
+        if not self.project_created or not self.report_ready:
+            return
+        directory = self.report_dir / "diagnostics"
+        directory.mkdir(parents=True, exist_ok=True)
+        record = self.report.setdefault("diagnostics", {"files": [], "errors": []})
+        rows = json.loads(self.incus(["list", "--format", "json"], timeout=10).stdout)
+        if not isinstance(rows, list):
+            raise CheckError("诊断实例列表格式错误")
+        config_keys = {"security.secureboot", "limits.cpu", "limits.memory", "image.architecture",
+                       "image.description", "image.os", "image.release", "image.serial", "image.type"}
+        device_keys = {"type", "pool", "path", "size", "network", "name", "nictype"}
+        owned_rows = {}
+        for row in rows:
+            if isinstance(row, dict) and isinstance(row.get("name"), str) and row["name"] in self.owned_instance_names:
+                owned_rows[row["name"]] = row
+        for row in owned_rows.values():
+            for config_field in ("config", "expanded_config"):
+                config = row.get(config_field) or {}
+                if isinstance(config, dict):
+                    self.diagnostic_secrets.update(value for key, value in config.items()
+                                                   if key not in config_keys and isinstance(value, str) and value)
+            for device_field in ("devices", "expanded_devices"):
+                devices = row.get(device_field) or {}
+                if isinstance(devices, dict):
+                    for device in devices.values():
+                        if isinstance(device, dict):
+                            self.diagnostic_secrets.update(value for key, value in device.items()
+                                                           if key not in device_keys and isinstance(value, str)
+                                                           and value and value != "agent:config")
+        for name, row in owned_rows.items():
+            if self.deadline is not None and time.monotonic() >= self.deadline:
+                record["errors"].append("诊断收集超过时限")
+                return
+            config = row.get("expanded_config") or row.get("config") or {}
+            devices = row.get("expanded_devices") or row.get("devices") or {}
+            if not isinstance(config, dict) or not isinstance(devices, dict):
+                record["errors"].append("实例诊断配置格式错误")
+                continue
+            safe_config = {
+                key: self.diagnostic_text(value, 256) for key, value in config.items()
+                if key in config_keys and isinstance(value, str)
+            }
+            safe_devices = {}
+            for device_name in ("root", "eth0", "agent"):
+                device = devices.get(device_name)
+                if not isinstance(device, dict):
+                    continue
+                safe_devices[device_name] = {
+                    key: self.diagnostic_text(value, 256) for key, value in device.items()
+                    if key in device_keys and isinstance(value, str)
+                }
+                if device_name == "agent" and device.get("source") == "agent:config":
+                    safe_devices[device_name]["source"] = "agent:config"
+            configuration = {
+                key: self.diagnostic_text(row.get(key), 256)
+                for key in ("name", "type", "status") if isinstance(row.get(key), str)
+            }
+            configuration.update(config=safe_config, devices=safe_devices)
+            path = directory / (name + "-config.json")
+            try:
+                path.write_text(json.dumps(configuration, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                record["files"].append(str(path.relative_to(self.report_dir)))
+            except (Exception, KeyboardInterrupt) as exc:
+                record["errors"].append(safe_error(exc))
+            for label, args in (
+                ("logs", ["info", name, "--show-log"]),
+                ("console", ["console", name, "--show-log"]),
+            ):
+                if self.deadline is not None and time.monotonic() >= self.deadline:
+                    record["errors"].append("诊断收集超过时限")
+                    return
+                try:
+                    result = self.incus(args, timeout=10)
+                    path = directory / (name + "-" + label + ".txt")
+                    path.write_text(self.diagnostic_text(result.stdout, self.DIAGNOSTIC_LIMIT), encoding="utf-8")
+                    record["files"].append(str(path.relative_to(self.report_dir)))
+                except (Exception, KeyboardInterrupt) as exc:
+                    record["errors"].append(safe_error(exc))
 
     def cleanup(self) -> bool:
         if not self.project_created:
@@ -495,7 +621,7 @@ class Acceptance:
                     if resource == "instances" and not force and row.get("status") != "Stopped":
                         try:
                             self.step(f"cleanup-stop-{index}", lambda: self.incus(
-                                ["stop", row[key], "--timeout", "20"], timeout=25))
+                                ["stop", row[key], "--timeout", "20"], timeout=25, diagnostic=True))
                         except Exception:
                             ok = False
                             force = True
@@ -545,9 +671,9 @@ class Acceptance:
             paths = self.step("verify-export", lambda: import_paths(self.output_dir, self.spec))
             self.step("create-project", self.create_project)
             self.step("profile-root", lambda: self.incus([
-                "profile", "device", "add", "default", "root", "disk", "pool=default", "path=/"]))
+                "profile", "device", "add", "default", "root", "disk", "pool=default", "path=/"], diagnostic=True))
             self.step("profile-network", lambda: self.incus([
-                "profile", "device", "add", "default", "eth0", "nic", "network=incusbr0", "name=eth0"]))
+                "profile", "device", "add", "default", "eth0", "nic", "network=incusbr0", "name=eth0"], diagnostic=True))
             self.step("import-image", lambda: self.incus([
                 "image", "import", *map(str, paths), "--alias", self.alias], timeout=300))
             self.step("create-instance", self.init_instance)
@@ -563,7 +689,7 @@ class Acceptance:
             self.step("test-password", lambda: self.guest(["chpasswd"], input=f"root:{self.password}\n"))
             self.check_boot("cold", addresses)
             initial = self.step("cold-identity", lambda: self.sample_identity("cold"))
-            self.step("restart-stop", lambda: self.incus(["stop", self.instance, "--timeout", "60"], timeout=90))
+            self.step("restart-stop", lambda: self.incus(["stop", self.instance, "--timeout", "60"], timeout=90, diagnostic=True))
             addresses = self.boot_ready("restart")
             self.check_boot("restart", addresses)
             restarted = self.step("restart-identity", lambda: self.sample_identity("restart"))
@@ -576,6 +702,15 @@ class Acceptance:
             signal.setitimer(signal.ITIMER_REAL, 0)
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
             previous_int = signal.signal(signal.SIGINT, signal.SIG_IGN)
+            if self.report["status"] != "success" and self.project_created and self.report_ready:
+                self.deadline = time.monotonic() + self.DIAGNOSTICS_TIMEOUT
+                signal.setitimer(signal.ITIMER_REAL, self.DIAGNOSTICS_TIMEOUT)
+                try:
+                    self.collect_diagnostics()
+                except (Exception, KeyboardInterrupt) as exc:
+                    self.report.setdefault("diagnostics", {"files": [], "errors": []})["errors"].append(safe_error(exc))
+                finally:
+                    signal.setitimer(signal.ITIMER_REAL, 0)
             self.deadline = time.monotonic() + self.CLEANUP_TIMEOUT
             signal.setitimer(signal.ITIMER_REAL, self.CLEANUP_TIMEOUT)
             try:

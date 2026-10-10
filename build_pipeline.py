@@ -260,6 +260,8 @@ class Pipeline:
                         "--config", f"limits.cpu={VM_CPU}", "--config", f"limits.memory={VM_MEMORY}",
                         "--device", f"root,size={VM_DISK}"])
             self.created_containers.append(name)
+            self.incus(["config", "device", "add", name, "agent", "disk", "source=agent:config"],
+                       diagnostic_stderr=True)
             self.incus(["start", name], timeout=self.agent_timeout, diagnostic_stderr=True)
             self.wait_for_container(name)
 
