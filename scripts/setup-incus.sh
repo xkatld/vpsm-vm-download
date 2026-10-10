@@ -11,9 +11,13 @@ fi
 sudo python3 -I -c 'import fcntl, os; fd = os.open("/dev/kvm", os.O_RDWR); version = fcntl.ioctl(fd, 0xAE00, 0); assert version == 12, "虚拟化接口版本不支持"; vm = fcntl.ioctl(fd, 0xAE01, 0); os.close(vm); os.close(fd)'
 sudo apt-get update
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-  incus qemu-system-x86 qemu-utils ovmf virtiofsd \
+  incus qemu-system-x86 qemu-utils ovmf virtiofsd genisoimage \
   openssh-client sshpass ca-certificates \
   python3-guestfs libguestfs-tools
+if ! sudo sh -c 'command -v mkisofs >/dev/null 2>&1 || command -v genisoimage >/dev/null 2>&1'; then
+  printf '%s\n' '代理配置盘生成工具缺失，需要 mkisofs 或 genisoimage' >&2
+  exit 1
+fi
 sudo systemctl start incus
 sudo timeout 120 incus admin waitready
 sudo incus admin init --preseed <<'YAML'

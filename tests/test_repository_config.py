@@ -1,3 +1,7 @@
+import os
+import shlex
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -38,6 +42,64 @@ class RepositoryConfigTests(unittest.TestCase):
         self.assertIn("ipv6.address: none", text)
         self.assertIn("driver: dir", text)
         self.assertIn("remote list --format=json", text)
+
+    def test_setup_installs_and_checks_config_disk_tools(self):
+        text = (ROOT / "scripts/setup-incus.sh").read_text()
+        commands = [shlex.split(line) for line in text.replace("\\\n", " ").splitlines()]
+        installs = [command for command in commands if command[:4] == [
+            "sudo", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install"
+        ]]
+        self.assertEqual(len(installs), 1)
+        self.assertIn("genisoimage", installs[0])
+        check = text.index("if ! sudo sh -c")
+        self.assertLess(text.index("apt-get install"), check)
+        self.assertLess(check, text.index("sudo systemctl start incus"))
+        self.assertLess(check, text.index("sudo incus admin init"))
+
+    def test_setup_config_disk_tool_availability(self):
+        wrapper = "\n".join([
+            "uname() { printf '%s\\n' x86_64; }",
+            "sudo() {",
+            '  printf \'%s\\n\' "$*" >> "$command_log"',
+            '  if [ "$1" = sh ]; then',
+            "    shift",
+            '    /usr/bin/env PATH="$tool_dir" /bin/sh "$@"',
+            '  elif [ "$*" = \'incus remote list --format=json\' ]; then',
+            "    printf '%s\\n' '{}'",
+            "  fi",
+            "}",
+            "qemu-img() { :; }",
+            "df() { :; }",
+            'source "$1"',
+        ])
+        for tools in ((), ("mkisofs",), ("genisoimage",), ("mkisofs", "genisoimage")):
+            with self.subTest(tools=tools), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                tool_dir = root / "tools"
+                tool_dir.mkdir()
+                for tool in tools:
+                    (tool_dir / tool).symlink_to("/bin/true")
+                command_log = root / "commands"
+                result = subprocess.run(
+                    ["bash", "--noprofile", "--norc", "-c", wrapper, "setup_test",
+                     str(ROOT / "scripts/setup-incus.sh")],
+                    env={**os.environ, "tool_dir": str(tool_dir), "command_log": str(command_log)},
+                    capture_output=True, text=True, timeout=15,
+                )
+                commands = command_log.read_text().splitlines()
+                install = next(i for i, command in enumerate(commands) if "apt-get install" in command)
+                check = next(i for i, command in enumerate(commands) if command.startswith("sh -c command -v"))
+                self.assertLess(install, check)
+                if tools:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertLess(check, commands.index("systemctl start incus"))
+                    self.assertLess(check, commands.index("incus admin init --preseed"))
+                    self.assertNotIn("代理配置盘生成工具缺失", result.stderr)
+                else:
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertIn("代理配置盘生成工具缺失", result.stderr)
+                    self.assertNotIn("systemctl start incus", commands)
+                    self.assertNotIn("incus admin init --preseed", commands)
 
 
 if __name__ == "__main__":
