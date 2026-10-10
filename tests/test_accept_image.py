@@ -53,6 +53,26 @@ class AcceptanceTests(unittest.TestCase):
         self.spec = ImageSpec("debian", "bookworm", "amd64", "default", "acceptance")
         self.acceptance = Acceptance(self.spec, Path("dist"), Path("acceptance"))
 
+    def test_short_instance_names_preserve_full_project_isolation_and_socket_limits(self):
+        suffixes = ["a" * 32, "b" * 32]
+        with patch("scripts.accept_image.uuid.uuid4", side_effect=[MagicMock(hex=value) for value in suffixes]):
+            acceptances = [Acceptance(self.spec, Path("dist"), Path("acceptance")) for _ in suffixes]
+        self.assertNotEqual(acceptances[0].project, acceptances[1].project)
+        for acceptance, suffix in zip(acceptances, suffixes):
+            self.assertEqual(acceptance.project, "vpsm-vm-accept-" + suffix)
+            self.assertEqual(acceptance.alias, "export-" + suffix)
+            self.assertEqual(acceptance.instance, "accept")
+            self.assertEqual(acceptance.clone_instance, "clone")
+            self.assertEqual(acceptance.owned_instance_names, {"accept", "clone"})
+            for directory in ("/var/log/incus", "/var/lib/incus/logs"):
+                for name in (acceptance.instance, acceptance.clone_instance):
+                    for socket in ("qemu.monitor", "qemu.spice"):
+                        path = f"{directory}/{acceptance.project}_{name}/{socket}"
+                        with self.subTest(path=path):
+                            self.assertLessEqual(len(path.encode("utf-8")), 107)
+                            old_path = f"{directory}/{acceptance.project}_{name}-{suffix}/{socket}"
+                            self.assertGreater(len(old_path.encode("utf-8")), 107)
+
     def test_import_verifies_and_orders_vm_artifacts(self):
         prefix = self.spec.container_name()
         summary = {"image_type": "virtual-machine", "exported_files": [prefix + ".qcow2", prefix + ".tar.xz"]}
@@ -203,6 +223,57 @@ class AcceptanceTests(unittest.TestCase):
             self.assertNotIn(hidden, emitted)
         self.assertTrue(caught.exception.__suppress_context__)
         self.assertEqual(acceptance.report["error"]["stage"], "cold-start")
+
+    def test_import_diagnostics_reuse_safe_stderr_and_timeout_limits(self):
+        acceptance = self.acceptance
+        acceptance.deadline = 105
+        stderr = ("镜像元数据缺少架构\n" + acceptance.password
+                  + "\ntoken=禁止显示令牌\n\x1b[31m导入失败\x1b[0m\r\x00\n::error::禁止执行\n" + "长" * 4000)
+        for error in (
+            subprocess.CalledProcessError(42, ["禁止显示参数"], output="禁止显示输出", stderr=stderr),
+            subprocess.TimeoutExpired(["禁止显示参数"], 5, output=b"hidden output", stderr=stderr.encode()),
+        ):
+            with self.subTest(error=type(error).__name__):
+                with patch("scripts.accept_image.time.monotonic", return_value=100):
+                    with patch("scripts.accept_image.subprocess.run", side_effect=error) as run:
+                        with self.assertRaises(CheckError) as caught:
+                            acceptance.incus(["image", "import", "dist/a.tar.xz", "dist/a.qcow2",
+                                              "--alias", acceptance.alias], timeout=300, diagnostic=True)
+                message = str(caught.exception)
+                self.assertIn("镜像元数据缺少架构", message)
+                self.assertIn("导入失败", message)
+                self.assertIn("退出码 42" if isinstance(error, subprocess.CalledProcessError) else "命令执行超时", message)
+                self.assertLess(len(message), acceptance.STDERR_LIMIT + 100)
+                self.assertTrue(caught.exception.__suppress_context__)
+                for hidden in (acceptance.password, "禁止显示令牌", "禁止显示参数", "禁止显示输出",
+                               "hidden output", "::", "\x1b", "\r", "\x00"):
+                    self.assertNotIn(hidden, message)
+                self.assertEqual(run.call_args.kwargs["timeout"], 5)
+        acceptance.deadline = None
+        for error in (subprocess.CalledProcessError(1, []), subprocess.TimeoutExpired([], 300)):
+            with self.subTest(error=type(error).__name__, stderr=None):
+                with patch("scripts.accept_image.subprocess.run", side_effect=error):
+                    with self.assertRaisesRegex(CheckError, "无标准错误输出"):
+                        acceptance.incus(["image", "import", "dist/a.tar.xz", "dist/a.qcow2"], diagnostic=True)
+
+    def test_import_diagnostics_require_exact_subcommand_and_project(self):
+        acceptance = self.acceptance
+        cases = (
+            (["incus", "--project", acceptance.project, "image", "import", "镜像"], {}),
+            (["incus", "--project", acceptance.project, "image", "import", "镜像"], {"diagnostic": True, "input": "输入"}),
+            (["incus", "--project", acceptance.project, "image", "import", "镜像"], {"diagnostic": True, "password": True}),
+            (["incus", "--project", "default", "image", "import", "镜像"], {"diagnostic": True}),
+            (["incus", "--project", acceptance.project, "image", "import-extra", "镜像"], {"diagnostic": True}),
+            (["incus", "--project", acceptance.project, "image", "show", "镜像"], {"diagnostic": True}),
+            (["incus", "--project", acceptance.project, "image", "delete", "镜像"], {"diagnostic": True}),
+        )
+        for args, kwargs in cases:
+            with self.subTest(args=args, kwargs=kwargs):
+                error = subprocess.CalledProcessError(7, ["隐藏参数"], output="隐藏输出", stderr="隐藏错误")
+                with patch("scripts.accept_image.subprocess.run", side_effect=error):
+                    with self.assertRaises(subprocess.CalledProcessError) as caught:
+                        acceptance.command(args, **kwargs)
+                self.assertEqual(safe_error(caught.exception), "命令执行失败")
 
     def test_command_diagnostics_are_explicit_and_forbid_credentials(self):
         acceptance = self.acceptance
@@ -499,6 +570,83 @@ class AcceptanceTests(unittest.TestCase):
         self.assertIn(["profile", "delete", "partial-profile"], args)
         self.assertNotIn(["profile", "delete", "default"], args)
         self.assertEqual(args[-1], ["project", "delete", acceptance.project])
+
+    def test_import_failure_reports_safe_error_and_cleans_partial_image(self):
+        acceptance = self.acceptance
+        paths = [Path("dist/a.tar.xz"), Path("dist/a.qcow2")]
+        events = []
+        fingerprint = "a" * 64
+        def respond(args, **kwargs):
+            if args[2] == "default":
+                self.assertEqual(args[3:6], ["project", "create", acceptance.project])
+                return completed()
+            self.assertEqual(args[:3], ["incus", "--project", acceptance.project])
+            command = args[3:]
+            events.append(command)
+            if command[:2] == ["image", "import"]:
+                self.assertEqual(command, ["image", "import", *map(str, paths), "--alias", acceptance.alias])
+                self.assertEqual(kwargs["timeout"], 300)
+                raise subprocess.CalledProcessError(42, args, output="禁止显示输出",
+                                                    stderr="镜像缺少架构\n" + acceptance.password)
+            if command == ["list", "--format", "json"]:
+                return completed("[]")
+            if command == ["image", "list", "--format", "json"]:
+                return completed(json.dumps([{"fingerprint": fingerprint}]))
+            if command == ["profile", "list", "--format", "json"]:
+                return completed('[{"name":"default"}]')
+            return completed()
+        def prepare_report():
+            acceptance.report_ready = True
+        with ExitStack() as stack:
+            stack.enter_context(patch("scripts.accept_image.signal.signal"))
+            stack.enter_context(patch("scripts.accept_image.signal.setitimer"))
+            stack.enter_context(patch("scripts.accept_image.time.monotonic", return_value=100))
+            stack.enter_context(patch("scripts.accept_image.import_paths", return_value=paths))
+            stack.enter_context(patch.object(acceptance, "preflight"))
+            stack.enter_context(patch.object(acceptance, "prepare_report", side_effect=prepare_report))
+            diagnostics = stack.enter_context(patch.object(acceptance, "collect_diagnostics",
+                                                           side_effect=lambda: events.append("diagnostics")))
+            report = stack.enter_context(patch.object(acceptance, "write_report",
+                                                      side_effect=lambda: events.append("report")))
+            stack.enter_context(patch("scripts.accept_image.subprocess.run", side_effect=respond))
+            output = stack.enter_context(patch("builtins.print"))
+            result = acceptance.run()
+        self.assertEqual(result, 1)
+        self.assertFalse(acceptance.project_created)
+        self.assertEqual(acceptance.report["error"]["stage"], "import-image")
+        self.assertIn("退出码 42", acceptance.report["error"]["message"])
+        self.assertIn("镜像缺少架构", acceptance.report["error"]["message"])
+        emitted = json.dumps(acceptance.report, ensure_ascii=False) + str(output.call_args_list)
+        self.assertNotIn(acceptance.password, emitted)
+        self.assertNotIn("禁止显示输出", emitted)
+        diagnostics.assert_called_once()
+        report.assert_called_once()
+        self.assertLess(events.index("diagnostics"), events.index(["image", "delete", fingerprint]))
+        self.assertEqual(events[-2:], [["project", "delete", acceptance.project], "report"])
+        self.assertFalse(any(isinstance(event, list) and event[0] in {"init", "start"} for event in events))
+        stages = {item["stage"]: item["status"] for item in acceptance.report["steps"]}
+        self.assertEqual(stages["import-image"], "FAIL")
+        self.assertEqual(stages["create-instance"], "NOT_RUN")
+        self.assertEqual(stages["cleanup-images-0"], "PASS")
+        self.assertEqual(stages["cleanup-project"], "PASS")
+
+    def test_failed_cleanup_deletes_both_short_names_in_owned_project(self):
+        acceptance = self.acceptance
+        acceptance.project_created = True
+        def respond(args, **kwargs):
+            self.assertEqual(args[:3], ["incus", "--project", acceptance.project])
+            if args[3:] == ["list", "--format", "json"]:
+                return completed(json.dumps([vm_row("accept"), vm_row("clone")]))
+            if args[3:] in (["image", "list", "--format", "json"], ["profile", "list", "--format", "json"]):
+                return completed("[]")
+            return completed()
+        with patch("scripts.accept_image.subprocess.run", side_effect=respond) as run:
+            self.assertTrue(acceptance.cleanup())
+        commands = [item.args[0][3:] for item in run.call_args_list]
+        self.assertIn(["delete", "accept", "--force"], commands)
+        self.assertIn(["delete", "clone", "--force"], commands)
+        self.assertEqual(commands[-1], ["project", "delete", acceptance.project])
+        self.assertFalse(acceptance.project_created)
 
     def test_success_cleanup_uses_normal_shutdown_without_force(self):
         acceptance = self.acceptance

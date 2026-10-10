@@ -30,6 +30,16 @@ class RepositoryConfigTests(unittest.TestCase):
         self.assertIn("path: acceptance/", text)
         self.assertIn("scripts/verify_artifacts.py --matrix", text)
 
+    def test_yaml_dependency_available_in_every_job(self):
+        text = (ROOT / ".github/workflows/build-images.yml").read_text()
+        validation = text.split("  validate:", 1)[1].split("  build:", 1)[0]
+        verification = text.split("  verify:", 1)[1]
+        self.assertLess(validation.index("apt-get install -y python3-yaml"), validation.index("python3 -m unittest"))
+        self.assertLess(verification.index("qemu-utils python3-yaml"), verification.index("python3 -I scripts/verify_artifacts.py"))
+        commands = (ROOT / "scripts/setup-incus.sh").read_text().replace("\\\n", " ").splitlines()
+        install = next(shlex.split(line) for line in commands if "apt-get install" in line)
+        self.assertIn("python3-yaml", install)
+
     def test_setup_rejects_missing_hardware_virtualization(self):
         text = (ROOT / "scripts/setup-incus.sh").read_text()
         self.assertIn('"$(uname -m)" != x86_64', text)

@@ -508,7 +508,9 @@ class ExportTests(PipelineTestCase):
 
         def normalize(directory, prefix):
             events.append("normalize")
-            return self.normalized_files(directory, prefix)
+            metadata, disk = self.normalized_files(directory, prefix)
+            metadata.write_bytes(b"metadata-after-normalize")
+            return metadata, disk
 
         def sanitize(path):
             events.append("sanitize")
@@ -528,6 +530,7 @@ class ExportTests(PipelineTestCase):
         self.assertEqual(pipeline.exported_files, [prefix + ".qcow2", prefix + ".tar.xz"])
         checksum = (self.output / "SHA256SUMS").read_text(encoding="utf-8")
         self.assertIn(hashlib.sha256(b"disk-after-sanitize").hexdigest(), checksum)
+        self.assertIn(hashlib.sha256(b"metadata-after-normalize").hexdigest(), checksum)
         self.assertNotIn(hashlib.sha256(b"disk-before-sanitize").hexdigest(), checksum)
         self.assertEqual({path.name for path in self.output.iterdir()}, {prefix + ".qcow2", prefix + ".tar.xz", "SHA256SUMS"})
 

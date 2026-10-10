@@ -13,7 +13,7 @@ sudo apt-get update
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
   incus qemu-system-x86 qemu-utils ovmf virtiofsd genisoimage \
   openssh-client sshpass ca-certificates \
-  python3-guestfs libguestfs-tools
+  python3-guestfs python3-yaml libguestfs-tools
 if ! sudo sh -c 'command -v mkisofs >/dev/null 2>&1 || command -v genisoimage >/dev/null 2>&1'; then
   printf '%s\n' '代理配置盘生成工具缺失，需要 mkisofs 或 genisoimage' >&2
   exit 1

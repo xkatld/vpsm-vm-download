@@ -32,6 +32,8 @@ jobs:
           persist-credentials: false
       - name: 执行单元与语法检查
         run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-yaml
           python3 -m compileall -q build_pipeline.py scripts tests
           python3 -m unittest discover -s tests -v
           bash -n scripts/setup-incus.sh
@@ -157,7 +159,7 @@ jobs:
       - name: 安装磁盘校验工具
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-utils
+          sudo apt-get install -y qemu-utils python3-yaml
       - uses: actions/download-artifact@v4
         with:
           name: build-matrix

@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from build_pipeline import ImageSpec
-from scripts import verify_artifacts
+from scripts import verify_artifacts, vm_image
 
 
 class VerifyArtifactsTests(unittest.TestCase):
@@ -46,6 +46,44 @@ class VerifyArtifactsTests(unittest.TestCase):
     def test_single_vm_verified_readonly(self):
         self.assertEqual(verify_artifacts.verify_artifact(self.root, self.expected), 2)
         self.validate_disk.assert_called_once_with(self.disk)
+
+    def write_metadata(self, data):
+        with tarfile.open(self.metadata, "w:xz") as archive:
+            member = tarfile.TarInfo("metadata.yaml")
+            member.size = len(data)
+            archive.addfile(member, io.BytesIO(data))
+
+    def test_metadata_architecture_checked_even_with_valid_summary_and_hashes(self):
+        for data in (
+            b"architecture: x86_64_v2\n",
+            b"architecture: amd64\n",
+            b"architecture: aarch64\n",
+            b"architecture: x86_64\nproperties:\n  user.vpsm.source_architecture: x86_64_v2\n",
+        ):
+            with self.subTest(data=data):
+                self.write_metadata(data)
+                self.write_checksums()
+                with self.assertRaises(ValueError):
+                    verify_artifacts.verify_artifact(self.root, self.expected)
+        self.validate_disk.assert_not_called()
+
+    def test_normalized_metadata_requires_new_checksum(self):
+        original = b"architecture: x86_64_v2\n"
+        self.write_metadata(original)
+        self.write_checksums()
+        self.write_metadata(vm_image.normalize_metadata(original))
+        with self.assertRaisesRegex(ValueError, "校验和不一致"):
+            verify_artifacts.verify_artifact(self.root, self.expected)
+        self.validate_disk.assert_not_called()
+        self.write_checksums()
+        before = self.metadata.read_bytes()
+        self.assertEqual(verify_artifacts.verify_artifact(self.root, self.expected), 2)
+        self.assertEqual(self.metadata.read_bytes(), before)
+
+    def test_expected_architecture_passed_to_metadata_validator(self):
+        with patch.object(verify_artifacts, "validate_metadata") as validate:
+            verify_artifacts.verify_artifact(self.root, self.expected)
+        validate.assert_called_once_with(self.metadata, expected_architecture="amd64")
 
     def test_summary_type_architecture_status_and_count_rejected(self):
         for key, value in (("image_type", "container"), ("architecture", "arm64"), ("status", "failed"), ("images", [])):

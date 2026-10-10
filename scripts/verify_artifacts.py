@@ -90,7 +90,7 @@ def verify_artifact(root: Path, expected: dict) -> int:
     for name, digest in checksums.items():
         if sha256(root / name) != digest:
             raise ValueError("最终产物校验和不一致")
-    validate_metadata(root / f"{prefix}.tar.xz")
+    validate_metadata(root / f"{prefix}.tar.xz", expected_architecture=expected["architecture"])
     validate_disk(root / f"{prefix}.qcow2")
     return 2
 

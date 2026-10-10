@@ -214,8 +214,8 @@ class Acceptance:
         self.report_dir = report_dir.resolve()
         suffix = uuid.uuid4().hex
         self.project = "vpsm-vm-accept-" + suffix
-        self.instance = "accept-" + suffix
-        self.clone_instance = "clone-" + suffix
+        self.instance = "accept"
+        self.clone_instance = "clone"
         self.owned_instance_names = {self.instance, self.clone_instance}
         self.alias = "export-" + suffix
         self.project_created = False
@@ -285,6 +285,7 @@ class Acceptance:
         diagnostic = diagnostic and input is None and not password and list(args[:3]) == [
             "incus", "--project", self.project] and (
                 list(args[3:4]) in (["init"], ["start"], ["stop"])
+                or list(args[3:5]) == ["image", "import"]
                 or list(args[3:6]) in (["config", "device", "add"], ["profile", "device", "add"]))
         try:
             return subprocess.run(list(args), input=input, text=True, capture_output=True,
@@ -675,7 +676,7 @@ class Acceptance:
             self.step("profile-network", lambda: self.incus([
                 "profile", "device", "add", "default", "eth0", "nic", "network=incusbr0", "name=eth0"], diagnostic=True))
             self.step("import-image", lambda: self.incus([
-                "image", "import", *map(str, paths), "--alias", self.alias], timeout=300))
+                "image", "import", *map(str, paths), "--alias", self.alias], timeout=300, diagnostic=True))
             self.step("create-instance", self.init_instance)
             addresses = self.boot_ready("cold")
             self.step("os-release", lambda: check_os_release(self.guest(["cat", "/etc/os-release"]).stdout, self.spec))
