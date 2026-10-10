@@ -9,6 +9,15 @@ if ! sudo test -c /dev/kvm || ! sudo test -r /dev/kvm || ! sudo test -w /dev/kvm
   exit 1
 fi
 sudo python3 -I -c 'import fcntl, os; fd = os.open("/dev/kvm", os.O_RDWR); version = fcntl.ioctl(fd, 0xAE00, 0); assert version == 12, "虚拟化接口版本不支持"; vm = fcntl.ioctl(fd, 0xAE01, 0); os.close(vm); os.close(fd)'
+sudo mkdir -p /etc/apt/keyrings
+curl -fsSL https://pkgs.zabbly.com/key.asc | sudo tee /etc/apt/keyrings/zabbly.asc >/dev/null
+sudo tee /etc/apt/sources.list.d/zabbly-incus.list >/dev/null <<'EOF'
+deb [signed-by=/etc/apt/keyrings/zabbly.asc] https://pkgs.zabbly.com/incus/stable noble main
+EOF
+installed_version=$(dpkg-query -W -f='${Version}' incus 2>/dev/null || true)
+if [ -n "$installed_version" ] && [ "${installed_version#*7.5}" = "$installed_version" ]; then
+  sudo DEBIAN_FRONTEND=noninteractive apt-get remove -y incus
+fi
 sudo apt-get update
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
   incus qemu-system-x86 qemu-utils ovmf virtiofsd genisoimage \
@@ -20,6 +29,17 @@ if ! sudo sh -c 'command -v mkisofs >/dev/null 2>&1 || command -v genisoimage >/
 fi
 sudo systemctl start incus
 sudo timeout 120 incus admin waitready
+server_version=$(sudo incus query /1.0 | python3 -I -c 'import json, sys; print(json.load(sys.stdin)["environment"]["server_version"])')
+client_version=$(incus version)
+case "$server_version" in 7.5 | 7.5.*) : ;; *)
+  printf '%s\n' "incus 服务端版本不符合要求：${server_version}，需要 7.5 系列" >&2
+  exit 1;;
+esac
+case "$client_version" in 7.5 | 7.5.*) : ;; *)
+  printf '%s\n' "incus 客户端版本不符合要求：${client_version}，需要 7.5 系列" >&2
+  exit 1;;
+esac
+printf 'incus 版本已确认：客户端 %s，服务端 %s\n' "$client_version" "$server_version"
 sudo incus admin init --preseed <<'YAML'
 config:
   images.auto_update_interval: "0"
