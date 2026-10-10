@@ -160,7 +160,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-utils python3-yaml
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           name: build-matrix
           path: expected
