@@ -43,7 +43,7 @@ jobs:
           matrix=$(python3 build_pipeline.py --manifest '镜像.md' --matrix)
           printf 'matrix=%s\n' "$matrix" >> "$GITHUB_OUTPUT"
           printf '%s\n' "$matrix" > build-matrix.json
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: build-matrix
           path: build-matrix.json
@@ -98,7 +98,7 @@ jobs:
           fi
       - name: 上传验收报告
         if: ${{ always() && steps.acceptance.outcome != 'skipped' }}
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: acceptance-${{ matrix.distro }}-${{ matrix.release }}-${{ matrix.architecture }}
           path: acceptance/
@@ -109,7 +109,7 @@ jobs:
           sudo chown -R "$(id -u):$(id -g)" dist
           chmod -R u+rwX dist
       - name: 上传通过验收的镜像
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: images-${{ matrix.distro }}-${{ matrix.release }}-${{ matrix.architecture }}
           path: dist/
@@ -134,7 +134,7 @@ jobs:
           chmod -R u+rwX diagnostics
       - name: 上传失败诊断
         if: failure()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: diagnostics-${{ matrix.distro }}-${{ matrix.release }}-${{ matrix.architecture }}
           path: diagnostics/
